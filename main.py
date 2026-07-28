@@ -14,7 +14,6 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import quote_plus, unquote_plus, urljoin, urlparse
 
 from pyrogram import Client, filters, raw, utils
-from pyrogram.handlers import MessageHandler, CallbackQueryHandler, RawUpdateHandler
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 from pyrogram.errors import (
     UserNotParticipant,
@@ -1428,6 +1427,7 @@ async def send_quota_topup_menu(message, user_id: int, daily_limit: int):
 
 
 # ===== START HANDLER =====
+@app.on_message(filters.command("start"))
 async def start(client, message):
     print(f"DIAG: /start received on @{getattr(client, 'bot_key', '?')} from {message.from_user.id}", flush=True)
     user_id = message.from_user.id
@@ -1481,6 +1481,7 @@ async def start(client, message):
     )
 
 
+@app.on_message(filters.command("premium"))
 async def premium_cmd(client, message):
     user_id = message.from_user.id
     await _upsert_user_profile(message.from_user, client.bot_key)
@@ -1489,6 +1490,7 @@ async def premium_cmd(client, message):
     await send_premium_menu(message, user_id)
 
 
+@app.on_message(filters.command("myplan"))
 async def myplan_cmd(client, message):
     user_id = message.from_user.id
     await _upsert_user_profile(message.from_user, client.bot_key)
@@ -1498,6 +1500,7 @@ async def myplan_cmd(client, message):
     await message.reply(text, reply_markup=markup)
 
 
+@app.on_message(filters.command("status"))
 async def status_cmd(client, message):
     user_id = message.from_user.id
     await _upsert_user_profile(message.from_user, client.bot_key)
@@ -1506,6 +1509,7 @@ async def status_cmd(client, message):
     await message.reply(await _status_text(client.bot_key))
 
 
+@app.on_message(filters.command("broadcast"))
 async def broadcast_cmd(client, message):
     user_id = message.from_user.id
     await _upsert_user_profile(message.from_user, client.bot_key)
@@ -1620,6 +1624,7 @@ async def broadcast_cmd(client, message):
 
 
 # ===== MAIN HANDLER =====
+@app.on_message(filters.private & ~filters.command(["start", "premium", "myplan", "status", "broadcast"]))
 async def terabox(client, message):
     user_id = message.from_user.id
     await _upsert_user_profile(message.from_user, client.bot_key)
@@ -1800,6 +1805,7 @@ async def terabox(client, message):
             pass
 
 
+@app.on_callback_query(filters.regex(r"^bcancel:([a-f0-9]{8})$"))
 async def broadcast_cancel_cb(client, callback_query):
     if int(callback_query.from_user.id) != int(ADMIN_USER_ID):
         return await callback_query.answer("❌ Not allowed.", show_alert=True)
@@ -1811,6 +1817,7 @@ async def broadcast_cancel_cb(client, callback_query):
     await callback_query.answer("Cancelling broadcast…", show_alert=False)
 
 
+@app.on_callback_query(filters.regex(r"^check_join$"))
 async def check_join_cb(client, callback_query):
     user_id = callback_query.from_user.id
     chat_ref = _force_sub_chat_ref()
@@ -1840,6 +1847,7 @@ async def check_join_cb(client, callback_query):
     await callback_query.answer("Not joined yet. Please join the channel first.", show_alert=True)
 
 
+@app.on_callback_query(filters.regex(r"^buyplan:([a-zA-Z0-9_]+)$"))
 async def buy_plan_cb(client, callback_query):
     user_id = callback_query.from_user.id
     plan_key = callback_query.data.split(":", 1)[1]
@@ -1861,6 +1869,7 @@ async def buy_plan_cb(client, callback_query):
     )
 
 
+@app.on_callback_query(filters.regex(r"^paymethod:([a-zA-Z0-9_]+):(upiqr|cards|stars)$"))
 async def pay_method_cb(client, callback_query):
     user_id = callback_query.from_user.id
     _, plan_key, method = callback_query.data.split(":")
@@ -1990,6 +1999,7 @@ async def pay_method_cb(client, callback_query):
         await callback_query.message.reply("Failed to create payment link. Please try again in a moment.")
 
 
+@app.on_callback_query(filters.regex(r"^checkpay:"))
 async def check_pay_cb(client, callback_query):
     user_id = callback_query.from_user.id
     pay_ref = callback_query.data.split(":", 1)[1].strip()
@@ -2096,6 +2106,7 @@ async def check_pay_cb(client, callback_query):
         await callback_query.message.reply("❌ Could not verify payment right now. Please try again shortly.")
 
 
+@app.on_callback_query(filters.regex(r"^cancelpay:"))
 async def cancel_pay_cb(client, callback_query):
     user_id = callback_query.from_user.id
     pay_ref = callback_query.data.split(":", 1)[1].strip()
@@ -2120,6 +2131,7 @@ async def cancel_pay_cb(client, callback_query):
     await callback_query.message.reply("❌ Payment session cancelled.\nUse /premium to create a new payment.")
 
 
+@app.on_raw_update()
 async def stars_payment_raw(client, update, users, chats):
     try:
         raw_updates = []
@@ -2174,33 +2186,6 @@ async def stars_payment_raw(client, update, users, chats):
                 await _process_stars_payment_sent_fallback(client, msg, action)
     except Exception as e:
         await report_error(client, "stars_payment_raw", e)
-
-
-HANDLER_SPECS = [
-    (MessageHandler, start, filters.command("start")),
-    (MessageHandler, premium_cmd, filters.command("premium")),
-    (MessageHandler, myplan_cmd, filters.command("myplan")),
-    (MessageHandler, status_cmd, filters.command("status")),
-    (MessageHandler, broadcast_cmd, filters.command("broadcast")),
-    (MessageHandler, terabox, filters.private & ~filters.command(["start", "premium", "myplan", "status", "broadcast"])),
-    (CallbackQueryHandler, broadcast_cancel_cb, filters.regex(r"^bcancel:([a-f0-9]{8})$")),
-    (CallbackQueryHandler, check_join_cb, filters.regex(r"^check_join$")),
-    (CallbackQueryHandler, buy_plan_cb, filters.regex(r"^buyplan:([a-zA-Z0-9_]+)$")),
-    (CallbackQueryHandler, pay_method_cb, filters.regex(r"^paymethod:([a-zA-Z0-9_]+):(upiqr|cards|stars)$")),
-    (CallbackQueryHandler, check_pay_cb, filters.regex(r"^checkpay:")),
-    (CallbackQueryHandler, cancel_pay_cb, filters.regex(r"^cancelpay:")),
-    (RawUpdateHandler, stars_payment_raw, None),
-]
-
-
-async def _debug_raw_update(client, update, users, chats):
-    print(f"DIAG: RAW UPDATE on @{getattr(client, 'bot_key', '?')}: {type(update).__name__}", flush=True)
-
-
-def _register_handlers(client: Client) -> None:
-    client.add_handler(RawUpdateHandler(_debug_raw_update), group=-1)
-    for handler_cls, func, flt in HANDLER_SPECS:
-        client.add_handler(handler_cls(func) if flt is None else handler_cls(func, flt))
 
 
 @bot.get("/premium/checkout/<pay_token>")
@@ -2793,38 +2778,20 @@ async def root():
 
 @bot.before_serving
 async def before_serving():
-    print("DIAG: before_serving entered - HTTP port opens now, bots start in background", flush=True)
-    asyncio.create_task(_startup_bots())
-
-
-async def _startup_bots():
     global mongo_client, mongo_db, users_col, payments_col, premium_reminder_task, client_watchdog_task
     if MONGO_URI and AsyncIOMotorClient is not None:
-        print("DIAG: connecting to Mongo...", flush=True)
-        try:
-            mongo_client = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=8000)
-            mongo_db = mongo_client[MONGO_DB_NAME]
-            users_col = mongo_db["users"]
-            payments_col = mongo_db["payments"]
-            await users_col.create_index("bot_keys")
-            print("DIAG: Mongo connected + index ensured", flush=True)
-        except Exception as e:
-            print(f"DIAG: Mongo connect/index FAILED: {type(e).__name__}: {e}", flush=True)
-            logger.warning("Mongo init failed: %s", e)
+        mongo_client = AsyncIOMotorClient(MONGO_URI)
+        mongo_db = mongo_client[MONGO_DB_NAME]
+        users_col = mongo_db["users"]
+        payments_col = mongo_db["payments"]
+        await users_col.create_index("bot_keys")
     else:
-        print("DIAG: Mongo not configured, skipping", flush=True)
         logger.warning("MongoDB not configured or motor missing; premium persistence disabled.")
 
-    try:
-        await app.start()
-        app.bot_key = _sanitize_bot_key(app.me.username, fallback_idx=1)
-        _register_handlers(app)
-        print(f"DIAG: bot started OK as @{app.me.username}", flush=True)
-        await _notify_admin(app, f"✅ Bot @{app.me.username} started on server.")
-    except Exception as e:
-        print(f"DIAG: bot start FAILED: {type(e).__name__}: {e}", flush=True)
-        logger.warning("Bot failed to start: %s", e)
-        return
+    await app.start()
+    app.bot_key = _sanitize_bot_key(app.me.username, fallback_idx=1)
+    print(f"DIAG: bot started OK as @{app.me.username}", flush=True)
+    await _notify_admin(app, f"✅ Bot @{app.me.username} started on server.")
 
     if premium_reminder_task is None or premium_reminder_task.done():
         premium_reminder_task = asyncio.create_task(_premium_reminder_loop())
