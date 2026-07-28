@@ -152,6 +152,8 @@ mongo_db = None
 users_col = None
 payments_col = None
 premium_reminder_task = None
+client_watchdog_task = None
+CLIENT_WATCHDOG_INTERVAL_SECONDS = 3 * 60
 _force_sub_warned = False
 # broadcast job_id -> {"cancel": asyncio.Event, "admin_id": int}
 _broadcast_jobs: dict[str, dict] = {}
@@ -2841,10 +2843,38 @@ async def _startup_bots():
     if premium_reminder_task is None or premium_reminder_task.done():
         premium_reminder_task = asyncio.create_task(_premium_reminder_loop())
 
+    global client_watchdog_task
+    if client_watchdog_task is None or client_watchdog_task.done():
+        client_watchdog_task = asyncio.create_task(_client_watchdog_loop())
+
+
+async def _client_watchdog_loop() -> None:
+    """
+    MTProto is a long-lived TCP socket; cloud NATs/load-balancers can drop it
+    silently while the process keeps running (no exception, no log). Ping each
+    client periodically and force a reconnect if the socket is actually dead.
+    """
+    while True:
+        await asyncio.sleep(CLIENT_WATCHDOG_INTERVAL_SECONDS)
+        for bot_key, client in list(CLIENTS.items()):
+            try:
+                await asyncio.wait_for(client.get_me(), timeout=20)
+            except Exception as e:
+                print(f"DIAG: watchdog - @{bot_key} unresponsive ({type(e).__name__}: {e}), reconnecting...", flush=True)
+                try:
+                    await client.stop(clear_handlers=False)
+                except Exception:
+                    pass
+                try:
+                    await client.start()
+                    print(f"DIAG: watchdog - @{bot_key} reconnected OK", flush=True)
+                except Exception as e2:
+                    print(f"DIAG: watchdog - @{bot_key} reconnect FAILED: {type(e2).__name__}: {e2}", flush=True)
+
 
 @bot.after_serving
 async def after_serving():
-    global premium_reminder_task
+    global premium_reminder_task, client_watchdog_task
     for client in CLIENTS.values():
         try:
             await _notify_admin(client, "⚠️ Bot is stopping.")
@@ -2854,6 +2884,14 @@ async def after_serving():
         premium_reminder_task.cancel()
         try:
             await premium_reminder_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+    if client_watchdog_task and not client_watchdog_task.done():
+        client_watchdog_task.cancel()
+        try:
+            await client_watchdog_task
         except asyncio.CancelledError:
             pass
         except Exception:
