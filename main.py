@@ -2202,7 +2202,12 @@ HANDLER_SPECS = [
 ]
 
 
+async def _debug_raw_update(client, update, users, chats):
+    print(f"DIAG: RAW UPDATE on @{getattr(client, 'bot_key', '?')}: {type(update).__name__}", flush=True)
+
+
 def _register_handlers(client: Client) -> None:
+    client.add_handler(RawUpdateHandler(_debug_raw_update), group=-1)
     for handler_cls, func, flt in HANDLER_SPECS:
         client.add_handler(handler_cls(func) if flt is None else handler_cls(func, flt))
 
