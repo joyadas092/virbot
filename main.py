@@ -87,12 +87,7 @@ PREMIUM_END_REMINDER_WINDOW_HOURS = int(os.getenv("PREMIUM_END_REMINDER_WINDOW_H
 # ===== CONFIG =====
 API_ID = int(os.getenv('API_ID'))
 API_HASH = os.getenv('API_HASH')
-BOT_TOKEN_1 = os.getenv('BOT_TOKEN_1') or os.getenv('BOT_TOKEN')
-BOT_TOKEN_2 = os.getenv('BOT_TOKEN_2')
-BOT_TOKEN_3 = os.getenv('BOT_TOKEN_3')
-BOT_TOKENS: list[tuple[int, str]] = [
-    (idx, tok) for idx, tok in enumerate([BOT_TOKEN_1, BOT_TOKEN_2, BOT_TOKEN_3], start=1) if tok
-]
+BOT_TOKEN = os.getenv('BOT_TOKEN_1') or os.getenv('BOT_TOKEN')
 TERABOX_API_KEY = os.getenv('XVERSE_API_KEY')
 SHORTLINK_API = os.getenv('SHORTLINK_API')
 BOT_USERNAME = os.getenv('BOT_USERNAME')
@@ -120,11 +115,7 @@ PREMIUM_PLANS = {
     },
 }
 
-CLIENT_INSTANCES: list[Client] = [
-    Client(f"teradl_bot_{idx}", api_id=API_ID, api_hash=API_HASH, bot_token=tok, in_memory=True, workers=4)
-    for idx, tok in BOT_TOKENS
-]
-CLIENTS: dict[str, Client] = {}
+app = Client("teradl_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True, workers=4)
 
 bot = Quart(__name__)
 # bot.config['PROVIDE_AUTOMATIC_OPTIONS'] = True
@@ -2331,13 +2322,11 @@ async def premium_verify():
         )
 
     payment_tokens.pop(pay_token, None)
-    send_client = CLIENTS.get(token_data.get("bot_key")) or next(iter(CLIENTS.values()), None)
-    if send_client is not None:
-        try:
-            await send_client.send_message(user_id, result_text)
-        except Exception:
-            pass
-        await _notify_purchase(send_client, user_id, plan_key, payment_id=payment_id, source="checkout_verify")
+    try:
+        await app.send_message(user_id, result_text)
+    except Exception:
+        pass
+    await _notify_purchase(app, user_id, plan_key, payment_id=payment_id, source="checkout_verify")
     return {"ok": True, "message": result_text}
 
 
@@ -2460,27 +2449,30 @@ async def razorpay_webhook():
                 }},
                 upsert=True,
             )
-        bot_key = (session_doc or {}).get("bot_key") or notes.get("bot_key")
-        send_client = CLIENTS.get(bot_key) or next(iter(CLIENTS.values()), None)
-        if send_client is not None:
-            try:
-                await send_client.send_message(user_id, result_text)
-            except Exception:
-                pass
-            await _notify_purchase(send_client, user_id, plan_key, payment_id=payment_id, source=f"webhook:{event}")
+        try:
+            await app.send_message(user_id, result_text)
+        except Exception:
+            pass
+        await _notify_purchase(app, user_id, plan_key, payment_id=payment_id, source=f"webhook:{event}")
     return {"ok": True}
 
 
-def _pick_client_for_user(bots_map: dict | None) -> Client | None:
-    if bots_map:
-        best_key, best_ts = None, None
-        for k, v in bots_map.items():
-            ts = (v or {}).get("last_seen_at")
-            if isinstance(ts, datetime) and (best_ts is None or ts > best_ts):
-                best_key, best_ts = k, ts
-        if best_key and best_key in CLIENTS:
-            return CLIENTS[best_key]
-    return next(iter(CLIENTS.values()), None)
+def _should_this_bot_notify(bots_map: dict | None) -> bool:
+    """
+    With 3 bots hosted as separate services sharing one DB, every instance's
+    reminder loop sees the same premium user doc. Only the bot the user most
+    recently used should actually send the DM, or all 3 would message them.
+    """
+    if not bots_map:
+        return True
+    best_key, best_ts = None, None
+    for k, v in bots_map.items():
+        ts = (v or {}).get("last_seen_at")
+        if isinstance(ts, datetime) and (best_ts is None or ts > best_ts):
+            best_key, best_ts = k, ts
+    if best_key is None:
+        return True
+    return best_key == getattr(app, "bot_key", None)
 
 
 async def _send_premium_expiry_reminders() -> None:
@@ -2500,9 +2492,9 @@ async def _send_premium_expiry_reminders() -> None:
         reminders = doc.get("premium_reminders") or {}
         if not user_id or not isinstance(premium_until, datetime):
             continue
-        client = _pick_client_for_user(doc.get("bots"))
-        if client is None:
+        if not _should_this_bot_notify(doc.get("bots")):
             continue
+        client = app
         if premium_until.tzinfo is None:
             premium_until = premium_until.replace(tzinfo=timezone.utc)
         delta = premium_until - now
@@ -2545,9 +2537,7 @@ async def _premium_reminder_loop() -> None:
         try:
             await _send_premium_expiry_reminders()
         except Exception as e:
-            report_client = next(iter(CLIENTS.values()), None)
-            if report_client is not None:
-                await report_error(report_client, "premium_reminder_loop", e)
+            await report_error(app, "premium_reminder_loop", e)
         await asyncio.sleep(30 * 60)
 
 
@@ -2808,7 +2798,7 @@ async def before_serving():
 
 
 async def _startup_bots():
-    global mongo_client, mongo_db, users_col, payments_col, premium_reminder_task
+    global mongo_client, mongo_db, users_col, payments_col, premium_reminder_task, client_watchdog_task
     if MONGO_URI and AsyncIOMotorClient is not None:
         print("DIAG: connecting to Mongo...", flush=True)
         try:
@@ -2825,30 +2815,20 @@ async def _startup_bots():
         print("DIAG: Mongo not configured, skipping", flush=True)
         logger.warning("MongoDB not configured or motor missing; premium persistence disabled.")
 
-    print(f"DIAG: CLIENT_INSTANCES count={len(CLIENT_INSTANCES)}", flush=True)
-    for idx, client in enumerate(CLIENT_INSTANCES, start=1):
-        print(f"DIAG: starting client slot {idx}...", flush=True)
-        try:
-            await client.start()
-            bot_key = _sanitize_bot_key(client.me.username, fallback_idx=idx)
-            client.bot_key = bot_key
-            CLIENTS[bot_key] = client
-            _register_handlers(client)
-            print(f"DIAG: slot {idx} started OK as @{client.me.username}", flush=True)
-            await _notify_admin(client, f"✅ Bot @{client.me.username} started on Render/server.")
-        except Exception as e:
-            print(f"DIAG: slot {idx} FAILED: {type(e).__name__}: {e}", flush=True)
-            logger.warning("Bot token slot %s failed to start: %s", idx, e)
-
-    if not CLIENTS:
-        print("DIAG: No bot clients started - check BOT_TOKEN_1/2/3", flush=True)
-        logger.warning("No bot clients started - check BOT_TOKEN_1/2/3")
+    try:
+        await app.start()
+        app.bot_key = _sanitize_bot_key(app.me.username, fallback_idx=1)
+        _register_handlers(app)
+        print(f"DIAG: bot started OK as @{app.me.username}", flush=True)
+        await _notify_admin(app, f"✅ Bot @{app.me.username} started on server.")
+    except Exception as e:
+        print(f"DIAG: bot start FAILED: {type(e).__name__}: {e}", flush=True)
+        logger.warning("Bot failed to start: %s", e)
         return
 
     if premium_reminder_task is None or premium_reminder_task.done():
         premium_reminder_task = asyncio.create_task(_premium_reminder_loop())
 
-    global client_watchdog_task
     if client_watchdog_task is None or client_watchdog_task.done():
         client_watchdog_task = asyncio.create_task(_client_watchdog_loop())
 
@@ -2856,35 +2836,33 @@ async def _startup_bots():
 async def _client_watchdog_loop() -> None:
     """
     MTProto is a long-lived TCP socket; cloud NATs/load-balancers can drop it
-    silently while the process keeps running (no exception, no log). Ping each
+    silently while the process keeps running (no exception, no log). Ping the
     client periodically and force a reconnect if the socket is actually dead.
     """
     while True:
         await asyncio.sleep(CLIENT_WATCHDOG_INTERVAL_SECONDS)
-        for bot_key, client in list(CLIENTS.items()):
+        try:
+            await asyncio.wait_for(app.get_me(), timeout=20)
+        except Exception as e:
+            print(f"DIAG: watchdog - bot unresponsive ({type(e).__name__}: {e}), reconnecting...", flush=True)
             try:
-                await asyncio.wait_for(client.get_me(), timeout=20)
-            except Exception as e:
-                print(f"DIAG: watchdog - @{bot_key} unresponsive ({type(e).__name__}: {e}), reconnecting...", flush=True)
-                try:
-                    await client.stop(clear_handlers=False)
-                except Exception:
-                    pass
-                try:
-                    await client.start()
-                    print(f"DIAG: watchdog - @{bot_key} reconnected OK", flush=True)
-                except Exception as e2:
-                    print(f"DIAG: watchdog - @{bot_key} reconnect FAILED: {type(e2).__name__}: {e2}", flush=True)
+                await app.stop(clear_handlers=False)
+            except Exception:
+                pass
+            try:
+                await app.start()
+                print("DIAG: watchdog - reconnected OK", flush=True)
+            except Exception as e2:
+                print(f"DIAG: watchdog - reconnect FAILED: {type(e2).__name__}: {e2}", flush=True)
 
 
 @bot.after_serving
 async def after_serving():
     global premium_reminder_task, client_watchdog_task
-    for client in CLIENTS.values():
-        try:
-            await _notify_admin(client, "⚠️ Bot is stopping.")
-        except Exception:
-            pass
+    try:
+        await _notify_admin(app, "⚠️ Bot is stopping.")
+    except Exception:
+        pass
     if premium_reminder_task and not premium_reminder_task.done():
         premium_reminder_task.cancel()
         try:
@@ -2901,11 +2879,10 @@ async def after_serving():
             pass
         except Exception:
             pass
-    for client in CLIENTS.values():
-        try:
-            await client.stop()
-        except Exception:
-            pass
+    try:
+        await app.stop()
+    except Exception:
+        pass
     if mongo_client is not None:
         mongo_client.close()
 
