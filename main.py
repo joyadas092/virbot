@@ -1602,7 +1602,7 @@ async def broadcast_cmd(client, message):
                     elapsed=elapsed,
                     cancelled=cancelled,
                 ),
-                reply_markup=cancel_markup if not cancelled and done < total else None,
+                markup=cancel_markup if not cancelled and done < total else None,
             )
 
     elapsed = time.monotonic() - started
@@ -1621,7 +1621,7 @@ async def broadcast_cmd(client, message):
             cancelled=cancelled,
             finished=True,
         ),
-        reply_markup=None,
+        markup=None,
     )
 
 
