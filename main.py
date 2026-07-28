@@ -2796,8 +2796,12 @@ async def root():
 
 @bot.before_serving
 async def before_serving():
+    print("DIAG: before_serving entered - HTTP port opens now, bots start in background", flush=True)
+    asyncio.create_task(_startup_bots())
+
+
+async def _startup_bots():
     global mongo_client, mongo_db, users_col, payments_col, premium_reminder_task
-    print("DIAG: before_serving entered", flush=True)
     if MONGO_URI and AsyncIOMotorClient is not None:
         print("DIAG: connecting to Mongo...", flush=True)
         try:
@@ -2830,7 +2834,9 @@ async def before_serving():
             logger.warning("Bot token slot %s failed to start: %s", idx, e)
 
     if not CLIENTS:
-        raise RuntimeError("No bot clients started - check BOT_TOKEN_1/2/3")
+        print("DIAG: No bot clients started - check BOT_TOKEN_1/2/3", flush=True)
+        logger.warning("No bot clients started - check BOT_TOKEN_1/2/3")
+        return
 
     if premium_reminder_task is None or premium_reminder_task.done():
         premium_reminder_task = asyncio.create_task(_premium_reminder_loop())
