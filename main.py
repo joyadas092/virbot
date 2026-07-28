@@ -121,7 +121,7 @@ PREMIUM_PLANS = {
 }
 
 CLIENT_INSTANCES: list[Client] = [
-    Client(f"teradl_bot_{idx}", api_id=API_ID, api_hash=API_HASH, bot_token=tok, in_memory=True)
+    Client(f"teradl_bot_{idx}", api_id=API_ID, api_hash=API_HASH, bot_token=tok, in_memory=True, workers=4)
     for idx, tok in BOT_TOKENS
 ]
 CLIENTS: dict[str, Client] = {}
