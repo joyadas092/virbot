@@ -86,7 +86,7 @@ PREMIUM_END_REMINDER_WINDOW_HOURS = int(os.getenv("PREMIUM_END_REMINDER_WINDOW_H
 # ===== CONFIG =====
 API_ID = int(os.getenv('API_ID'))
 API_HASH = os.getenv('API_HASH')
-BOT_TOKEN = os.getenv('BOT_TOKEN_1') or os.getenv('BOT_TOKEN')
+BOT_TOKEN = os.getenv('BOT_TOKEN')
 TERABOX_API_KEY = os.getenv('XVERSE_API_KEY')
 SHORTLINK_API = os.getenv('SHORTLINK_API')
 BOT_USERNAME = os.getenv('BOT_USERNAME')
@@ -114,17 +114,24 @@ PREMIUM_PLANS = {
     },
 }
 
-app = Client("teradl_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True, workers=4)
+app = Client(
+    "terabox_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
 
 bot = Quart(__name__)
 # bot.config['PROVIDE_AUTOMATIC_OPTIONS'] = True
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
 
 def _sanitize_bot_key(raw: str, fallback_idx: int = 0) -> str:
     cleaned = re.sub(r"[^a-z0-9_]", "_", (raw or "").lower())
     return cleaned or f"bot_{fallback_idx}"
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+# bot_info =  app.get_me()
+# bot_username = bot_info.username
 
 # ===== MEMORY STORAGE (TEMP ONLY) =====
 # user_id -> {"remaining": int, "date": "YYYY-MM-DD"}
@@ -142,8 +149,6 @@ mongo_db = None
 users_col = None
 payments_col = None
 premium_reminder_task = None
-client_watchdog_task = None
-CLIENT_WATCHDOG_INTERVAL_SECONDS = 3 * 60
 _force_sub_warned = False
 # broadcast job_id -> {"cancel": asyncio.Event, "admin_id": int}
 _broadcast_jobs: dict[str, dict] = {}
@@ -365,8 +370,8 @@ async def _notify_admin(client: Client, text: str) -> None:
         return
     try:
         await client.send_message(ADMIN_USER_ID, text, disable_web_page_preview=True)
-    except Exception as e:
-        print(f"DIAG: _notify_admin FAILED for @{getattr(client, 'bot_key', '?')}: {type(e).__name__}: {e}", flush=True)
+    except Exception:
+        pass
 
 
 async def _notify_premium_purchase(client: Client, user_id: int, plan_key: str, until: datetime, payment_id: str = "",
@@ -486,7 +491,6 @@ async def _send_stars_invoice(client: Client, chat_id: int, user_id: int, plan_k
                 "source": "create:stars",
                 "currency": "XTR",
                 "amount": int(stars_amount),
-                "bot_key": client.bot_key,
             }},
             upsert=True,
         )
@@ -626,7 +630,7 @@ async def _process_stars_payment_sent_fallback(client: Client, msg, action) -> N
     )
 
 
-async def _create_razorpay_order(user_id: int, plan_key: str, pay_token: str, bot_key: str = "") -> dict:
+async def _create_razorpay_order(user_id: int, plan_key: str, pay_token: str) -> dict:
     plan = PREMIUM_PLANS[plan_key]
     payload = {
         "amount": int(plan["amount_inr"]) * 100,
@@ -636,7 +640,6 @@ async def _create_razorpay_order(user_id: int, plan_key: str, pay_token: str, bo
             "user_id": str(user_id),
             "plan_key": plan_key,
             "payment_token": pay_token,
-            "bot_key": bot_key,
         },
     }
     headers = await _razorpay_auth_header()
@@ -649,7 +652,7 @@ async def _create_razorpay_order(user_id: int, plan_key: str, pay_token: str, bo
             return json.loads(body)
 
 
-async def _create_razorpay_payment_link(user_id: int, plan_key: str, pay_ref: str, bot_key: str = "") -> dict:
+async def _create_razorpay_payment_link(user_id: int, plan_key: str, pay_ref: str) -> dict:
     plan = PREMIUM_PLANS[plan_key]
     expires_at = int(_now_ts() + PAYMENT_SESSION_TTL_SECONDS)
     payload = {
@@ -665,7 +668,6 @@ async def _create_razorpay_payment_link(user_id: int, plan_key: str, pay_ref: st
             "user_id": str(user_id),
             "plan_key": plan_key,
             "pay_ref": pay_ref,
-            "bot_key": bot_key,
         },
     }
     headers = await _razorpay_auth_header()
@@ -687,7 +689,7 @@ async def _create_razorpay_payment_link(user_id: int, plan_key: str, pay_ref: st
             raise RuntimeError(f"Razorpay payment-link error: {resp.status} {body[:300]}")
 
 
-async def _create_razorpay_upi_qr(user_id: int, plan_key: str, pay_ref: str, bot_key: str = "") -> dict:
+async def _create_razorpay_upi_qr(user_id: int, plan_key: str, pay_ref: str) -> dict:
     plan = PREMIUM_PLANS[plan_key]
     close_at = int(_now_ts() + PAYMENT_SESSION_TTL_SECONDS)
     payload = {
@@ -701,7 +703,6 @@ async def _create_razorpay_upi_qr(user_id: int, plan_key: str, pay_ref: str, bot
             "user_id": str(user_id),
             "plan_key": plan_key,
             "pay_ref": pay_ref,
-            "bot_key": bot_key,
         },
     }
     headers = await _razorpay_auth_header()
@@ -1178,6 +1179,7 @@ async def _broadcast_send_one(
     admin_chat_id: int,
     src_message_id: int | None,
     payload_text: str,
+    bot_key: str,
 ) -> str:
     """
     Returns: sent | blocked | removed | failed
@@ -1201,15 +1203,16 @@ async def _broadcast_send_one(
             admin_chat_id=admin_chat_id,
             src_message_id=src_message_id,
             payload_text=payload_text,
+            bot_key=bot_key,
         )
     except UserIsBlocked:
-        await _remove_user_record(target_id, client.bot_key)
+        await _remove_user_record(target_id, bot_key)
         return "blocked"
     except InputUserDeactivated:
-        await _remove_user_record(target_id, client.bot_key)
+        await _remove_user_record(target_id, bot_key)
         return "removed"
     except PeerIdInvalid:
-        await _remove_user_record(target_id, client.bot_key)
+        await _remove_user_record(target_id, bot_key)
         return "removed"
     except Exception:
         return "failed"
@@ -1239,8 +1242,8 @@ async def send_unlock_once(client: Client, message, user_id: int) -> bool:
         user["last_unlock_prompt_ts"] = now
         user_data[user_id] = user
 
-    shortlink = await generate_shortlink(user_id, client.me.username)
-    premium_url = f"https://t.me/{client.me.username}?start=premium"
+    shortlink = await generate_shortlink(user_id)
+    premium_url = f"https://t.me/{BOT_USERNAME}?start=premium"
     await message.reply(
         f"❌ Your Current Limit reached.\n\nWatch below ad to get next {LIMIT_FREE_REQUESTS} downloads:"
         f"Apple Users: Copy Ad Link, open in browser, and fully close Telegram."
@@ -1308,7 +1311,7 @@ async def report_error(client: Client, where: str, err: Exception, extra: dict |
         return
 
 
-async def generate_shortlink(user_id, bot_username: str):
+async def generate_shortlink(user_id):
     _cleanup_expired_tokens()
     token = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
 
@@ -1318,7 +1321,7 @@ async def generate_shortlink(user_id, bot_username: str):
         "expires_at": _now_ts() + UNLOCK_TOKEN_TTL_SECONDS,
     }
 
-    destination = f"https://t.me/{bot_username}?start={token}"
+    destination = f"https://t.me/{BOT_USERNAME}?start={token}"
 
     url = f"https://nanolinks.in/api?api={SHORTLINK_API}&url={destination}"
 
@@ -1429,7 +1432,6 @@ async def send_quota_topup_menu(message, user_id: int, daily_limit: int):
 # ===== START HANDLER =====
 @app.on_message(filters.command("start"))
 async def start(client, message):
-    print(f"DIAG: /start received on @{getattr(client, 'bot_key', '?')} from {message.from_user.id}", flush=True)
     user_id = message.from_user.id
     await _upsert_user_profile(message.from_user, client.bot_key)
     args = message.text.split(" ")
@@ -1476,8 +1478,7 @@ async def start(client, message):
     await message.reply(
         "Welcome to Tera Downloader from @BotsXP |\n\n"
         "Send TeraBox links to get started.\n\n"
-        f"Supported domains:\n{_supported_terabox_domains_text()}\n\n"
-    
+        f"Supported domains:\n{_supported_terabox_domains_text()}"
     )
 
 
@@ -1574,6 +1575,7 @@ async def broadcast_cmd(client, message):
             admin_chat_id=message.chat.id,
             src_message_id=src_id,
             payload_text=payload_text,
+            bot_key=client.bot_key,
         )
         done += 1
         if outcome == "sent":
@@ -1600,7 +1602,7 @@ async def broadcast_cmd(client, message):
                     elapsed=elapsed,
                     cancelled=cancelled,
                 ),
-                markup=cancel_markup if not cancelled and done < total else None,
+                reply_markup=cancel_markup if not cancelled and done < total else None,
             )
 
     elapsed = time.monotonic() - started
@@ -1619,7 +1621,7 @@ async def broadcast_cmd(client, message):
             cancelled=cancelled,
             finished=True,
         ),
-        markup=None,
+        reply_markup=None,
     )
 
 
@@ -1909,13 +1911,13 @@ async def pay_method_cb(client, callback_query):
         qr_code_id = ""
 
         if method == "cards":
-            link_data = await _create_razorpay_payment_link(user_id, plan_key, pay_ref, bot_key=client.bot_key)
+            link_data = await _create_razorpay_payment_link(user_id, plan_key, pay_ref)
             payment_link_id = link_data.get("id", "")
             short_url = link_data.get("short_url", "")
             if not short_url:
                 raise RuntimeError("Missing payment link URL from Razorpay")
         elif method == "upiqr":
-            qr_data = await _create_razorpay_upi_qr(user_id, plan_key, pay_ref, bot_key=client.bot_key)
+            qr_data = await _create_razorpay_upi_qr(user_id, plan_key, pay_ref)
             qr_image_url = qr_data.get("image_url", "")
             qr_code_id = qr_data.get("id", "")
             if not qr_image_url:
@@ -1938,7 +1940,6 @@ async def pay_method_cb(client, callback_query):
                     "expires_at": _now_ts() + PAYMENT_SESSION_TTL_SECONDS,
                     "source": f"create:{method}",
                     "payment_method": method,
-                    "bot_key": client.bot_key,
                 }},
                 upsert=True,
             )
@@ -2202,7 +2203,7 @@ async def premium_checkout(pay_token: str):
     if plan_key not in PREMIUM_PLANS:
         return Response("Invalid plan.", status=400)
 
-    order = await _create_razorpay_order(user_id, plan_key, pay_token, bot_key=data.get("bot_key", ""))
+    order = await _create_razorpay_order(user_id, plan_key, pay_token)
     order_id = order.get("id")
     if not order_id:
         return Response("Failed to create payment order.", status=500)
@@ -2216,7 +2217,6 @@ async def premium_checkout(pay_token: str):
                 "plan_key": plan_key,
                 "status": "created",
                 "created_at": _utc_now(),
-                "bot_key": data.get("bot_key", ""),
             }},
             upsert=True,
         )
@@ -2442,9 +2442,9 @@ async def razorpay_webhook():
     return {"ok": True}
 
 
-def _should_this_bot_notify(bots_map: dict | None) -> bool:
+def _should_this_bot_notify(client: Client, bots_map: dict | None) -> bool:
     """
-    With 3 bots hosted as separate services sharing one DB, every instance's
+    All 3 bots are deployed separately but share one DB, so every instance's
     reminder loop sees the same premium user doc. Only the bot the user most
     recently used should actually send the DM, or all 3 would message them.
     """
@@ -2457,10 +2457,10 @@ def _should_this_bot_notify(bots_map: dict | None) -> bool:
             best_key, best_ts = k, ts
     if best_key is None:
         return True
-    return best_key == getattr(app, "bot_key", None)
+    return best_key == getattr(client, "bot_key", None)
 
 
-async def _send_premium_expiry_reminders() -> None:
+async def _send_premium_expiry_reminders(client: Client) -> None:
     if users_col is None:
         return
     now = _utc_now()
@@ -2477,9 +2477,8 @@ async def _send_premium_expiry_reminders() -> None:
         reminders = doc.get("premium_reminders") or {}
         if not user_id or not isinstance(premium_until, datetime):
             continue
-        if not _should_this_bot_notify(doc.get("bots")):
+        if not _should_this_bot_notify(client, doc.get("bots")):
             continue
-        client = app
         if premium_until.tzinfo is None:
             premium_until = premium_until.replace(tzinfo=timezone.utc)
         delta = premium_until - now
@@ -2517,12 +2516,12 @@ async def _send_premium_expiry_reminders() -> None:
             await users_col.update_one({"user_id": user_id}, {"$set": set_fields}, upsert=True)
 
 
-async def _premium_reminder_loop() -> None:
+async def _premium_reminder_loop(client: Client) -> None:
     while True:
         try:
-            await _send_premium_expiry_reminders()
+            await _send_premium_expiry_reminders(client)
         except Exception as e:
-            await report_error(app, "premium_reminder_loop", e)
+            await report_error(client, "premium_reminder_loop", e)
         await asyncio.sleep(30 * 60)
 
 
@@ -2771,14 +2770,9 @@ async def health():
     return {"ok": True, "service": "teradl-bot"}, 200
 
 
-@bot.get("/")
-async def root():
-    return {"ok": True, "service": "teradl-bot"}, 200
-
-
 @bot.before_serving
 async def before_serving():
-    global mongo_client, mongo_db, users_col, payments_col, premium_reminder_task, client_watchdog_task
+    global mongo_client, mongo_db, users_col, payments_col, premium_reminder_task
     if MONGO_URI and AsyncIOMotorClient is not None:
         mongo_client = AsyncIOMotorClient(MONGO_URI)
         mongo_db = mongo_client[MONGO_DB_NAME]
@@ -2787,73 +2781,32 @@ async def before_serving():
         await users_col.create_index("bot_keys")
     else:
         logger.warning("MongoDB not configured or motor missing; premium persistence disabled.")
-
     await app.start()
     app.bot_key = _sanitize_bot_key(app.me.username, fallback_idx=1)
-    print(f"DIAG: bot started OK as @{app.me.username}", flush=True)
     await _notify_admin(app, f"✅ Bot @{app.me.username} started on server.")
-
     if premium_reminder_task is None or premium_reminder_task.done():
-        premium_reminder_task = asyncio.create_task(_premium_reminder_loop())
-
-    if client_watchdog_task is None or client_watchdog_task.done():
-        client_watchdog_task = asyncio.create_task(_client_watchdog_loop())
-
-
-async def _client_watchdog_loop() -> None:
-    """
-    MTProto is a long-lived TCP socket; cloud NATs/load-balancers can drop it
-    silently while the process keeps running (no exception, no log). Ping the
-    client periodically and force a reconnect if the socket is actually dead.
-    """
-    while True:
-        await asyncio.sleep(CLIENT_WATCHDOG_INTERVAL_SECONDS)
-        try:
-            await asyncio.wait_for(app.get_me(), timeout=20)
-        except Exception as e:
-            print(f"DIAG: watchdog - bot unresponsive ({type(e).__name__}: {e}), reconnecting...", flush=True)
-            try:
-                await app.stop(clear_handlers=False)
-            except Exception:
-                pass
-            try:
-                await app.start()
-                print("DIAG: watchdog - reconnected OK", flush=True)
-            except Exception as e2:
-                print(f"DIAG: watchdog - reconnect FAILED: {type(e2).__name__}: {e2}", flush=True)
+        premium_reminder_task = asyncio.create_task(_premium_reminder_loop(app))
 
 
 @bot.after_serving
 async def after_serving():
-    global premium_reminder_task, client_watchdog_task
-    try:
-        await _notify_admin(app, "⚠️ Bot is stopping.")
-    except Exception:
-        pass
+    global premium_reminder_task
+    await _notify_admin(app, "⚠️ Bot is stopping.")
     if premium_reminder_task and not premium_reminder_task.done():
         premium_reminder_task.cancel()
         try:
             await premium_reminder_task
-        except asyncio.CancelledError:
-            pass
         except Exception:
             pass
-    if client_watchdog_task and not client_watchdog_task.done():
-        client_watchdog_task.cancel()
-        try:
-            await client_watchdog_task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
-    try:
-        await app.stop()
-    except Exception:
-        pass
+    await app.stop()
     if mongo_client is not None:
         mongo_client.close()
 
 
+# if __name__ == '__main__':
+
+# bot.run(port=8000)
 if __name__ == '__main__':
-    port = int(os.getenv("PORT", "8080"))
-    asyncio.run(bot.run_task(host='0.0.0.0', port=port))
+    loop = asyncio.get_event_loop()
+    loop.create_task(bot.run_task(host='0.0.0.0', port=8080))
+    loop.run_forever()
