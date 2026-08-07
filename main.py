@@ -46,16 +46,40 @@ except Exception:
 load_dotenv()
 BOT_BOOT_TIME_UTC = datetime.now(timezone.utc)
 
-# Telegram allows bots to upload up to 2 GB; override via TELEGRAM_MAX_UPLOAD_MB if needed.
-TELEGRAM_MAX_UPLOAD_MB = float(os.getenv("TELEGRAM_MAX_UPLOAD_MB", "2048"))
 LIMIT_FREE_REQUESTS = 3
 UNLOCK_TOKEN_TTL_SECONDS = 60 * 60  # 1 hour to use the unlock token
 STREAM_TOKEN_TTL_SECONDS = 15 * 60  # 15 minutes
 MAX_LINKS_PER_MESSAGE = 3
 UNLOCK_PROMPT_COOLDOWN_SECONDS = 90
 INVALID_LINK_REPLY_COOLDOWN_SECONDS = 120
-DISKWALA_DOMAIN_KEYWORDS = ("diskwala",)
-SUPPORTED_DISKWALA_DOMAINS = ("diskwala.com", "www.diskwala.com")
+TERABOX_DOMAIN_KEYWORDS = (
+    "terabox",
+    "tera",
+    "1024tera",
+    "1024terabox",
+    "terashare",
+    "tersharefile",
+    "terasharefile",
+    "4funbox",
+    "mirrobox",
+    "nephobox",
+    "momerybox",
+)
+SUPPORTED_TERABOX_DOMAINS = (
+    "terabox.com",
+    "teraboxapp.com",
+    "1024tera.com",
+    "1024terabox.com",
+    "terasharefile.com",
+    "tersharefile.com",
+    "terasharelink.com",
+    "teraboxlink.com",
+    "terafileshare.com",
+    "4funbox.com",
+    "mirrobox.com",
+    "nephobox.com",
+    "momerybox.com",
+)
 def _parse_admin_ids() -> set[int]:
     ids: set[int] = set()
     for env_name in ("ADMIN_USER_IDS", "ADMIN_USER_ID"):
@@ -79,27 +103,26 @@ PREMIUM_END_REMINDER_WINDOW_HOURS = int(os.getenv("PREMIUM_END_REMINDER_WINDOW_H
 API_ID = int(os.getenv('API_ID'))
 API_HASH = os.getenv('API_HASH')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-DISKWALA_API_KEY = os.getenv("DISKWALA_API_KEY", "").strip()
-DISKWALA_API_BASE = os.getenv("DISKWALA_API_BASE", "http://teradl.kingx.dev:8080").strip().rstrip("/")
+TERABOX_API_KEY = os.getenv('XVERSE_API_KEY')
 SHORTLINK_API = os.getenv('SHORTLINK_API')
 BOT_USERNAME = os.getenv('BOT_USERNAME')
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 PUBLIC_BASE_URL = PUBLIC_BASE_URL.strip().strip('"').strip("'").rstrip("/")  # e.g. https://your-domain.com
 FORCE_SUB_CHANNEL = os.getenv("FORCE_SUB_CHANNEL", "")  # your updates channel
 MONGO_URI = os.getenv("MONGO_URI", "").strip()
-MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "").strip()
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "teradl").strip()
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "").strip()
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "").strip()
 RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "").strip()
 
 PREMIUM_PLANS = {
-    # "day": {"label": "1 Day", "amount_inr": 5, "days": 1, "stars": 10},
-    "week": {"label": "1 Week", "amount_inr": 30, "days": 7, "stars": 60},
-    "month": {"label": "1 Month", "amount_inr": 100, "days": 30, "stars": 200},
-    "quarter": {"label": "3 Months", "amount_inr": 300, "days": 90, "stars": 600},
+    # "day": {"label": "1 Day", "amount_inr": 3, "days": 1, "stars": 6},
+    "week": {"label": "1 Week", "amount_inr": 20, "days": 7, "stars": 40},
+    "month": {"label": "1 Month", "amount_inr": 65, "days": 30, "stars": 130},
+    "quarter": {"label": "3 Months", "amount_inr": 150, "days": 90, "stars": 300},
     "quota50": {
         "label": "Quota Top-up (+50 today)",
-        "amount_inr": 5,
+        "amount_inr": 3,
         "days": 0,
         "stars": 10,
         "quota_add": 50,
@@ -108,7 +131,7 @@ PREMIUM_PLANS = {
 }
 
 app = Client(
-    "diskwala_downloader_bot",
+    "terabox_bot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN
@@ -135,8 +158,6 @@ user_locks: dict[int, asyncio.Lock] = {}
 tokens: dict[str, dict] = {}
 # stream_token -> {"url": str, "expires_at": float}
 stream_tokens: dict[str, dict] = {}
-# file_token -> pending Get File request metadata
-file_tokens: dict[str, dict] = {}
 payment_tokens: dict[str, dict] = {}
 
 mongo_client = None
@@ -147,8 +168,6 @@ premium_reminder_task = None
 _force_sub_warned = False
 # broadcast job_id -> {"cancel": asyncio.Event, "admin_id": int}
 _broadcast_jobs: dict[str, dict] = {}
-# transfer job_id -> {"cancel": asyncio.Event, "user_id": int}
-_file_transfer_jobs: dict[str, dict] = {}
 
 # In-memory admin toggles (not persisted; reset on restart)
 QUOTA_ENABLED = True  # /shortlink_on|off - when False, free users must buy premium after free quota
@@ -199,8 +218,6 @@ def _cleanup_expired_tokens() -> None:
         stream_tokens.pop(t, None)
     for t in [k for k, v in payment_tokens.items() if v.get("expires_at", 0) <= now]:
         payment_tokens.pop(t, None)
-    for t in [k for k, v in file_tokens.items() if v.get("expires_at", 0) <= now]:
-        file_tokens.pop(t, None)
 
 
 def _utc_now() -> datetime:
@@ -472,7 +489,9 @@ def _format_ago(ts: float | None) -> str:
 
 def _api_status_text() -> str:
     labels = [
-        ("diskwala", "DiskWala API"),
+        ("api1", "API1 (vercel, free)"),
+        ("api2", "API2 (hostinger, free)"),
+        ("xverse", "API3 (xverse, paid fallback)"),
     ]
     lines = ["🔌 API Health & Usage"]
     for key, label in labels:
@@ -534,7 +553,7 @@ async def _send_stars_invoice(client: Client, chat_id: int, user_id: int, plan_k
     prices = [raw.types.LabeledPrice(label=plan["label"], amount=stars_amount)]
     invoice = raw.types.Invoice(currency="XTR", prices=prices)
     media = raw.types.InputMediaInvoice(
-        title=f"DiskWala DL - {plan['label']}",
+        title=f"TeraDL - {plan['label']}",
         description=f"Buy {plan['label']} using Telegram Stars",
         invoice=invoice,
         payload=invoice_payload.encode("utf-8"),
@@ -722,7 +741,7 @@ async def _create_razorpay_payment_link(user_id: int, plan_key: str, pay_ref: st
         "amount": int(plan["amount_inr"]) * 100,
         "currency": "INR",
         "accept_partial": False,
-        "description": f"DiskWala DL Premium - {plan['label']}",
+        "description": f"TeraDL Premium - {plan['label']}",
         "reference_id": f"tg_{user_id}_{plan_key}_{int(_now_ts())}",
         "expire_by": expires_at,
         "notify": {"sms": False, "email": False},
@@ -761,7 +780,7 @@ async def _create_razorpay_upi_qr(user_id: int, plan_key: str, pay_ref: str) -> 
         "fixed_amount": True,
         "payment_amount": int(plan["amount_inr"]) * 100,
         "close_by": close_at,
-        "description": f"DiskWala DL Premium - {plan['label']}",
+        "description": f"TeraDL Premium - {plan['label']}",
         "notes": {
             "user_id": str(user_id),
             "plan_key": plan_key,
@@ -792,7 +811,7 @@ async def _download_qr_image_for_upload(image_url: str, pay_ref: str) -> BytesIO
         raise RuntimeError("Missing QR image URL")
     timeout = aiohttp.ClientTimeout(total=20)
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; DiskWalaDLBot/1.0)",
+        "User-Agent": "Mozilla/5.0 (compatible; TeraDLBot/1.0)",
         "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
     }
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
@@ -995,13 +1014,13 @@ def extract_urls(message, limit: int = MAX_LINKS_PER_MESSAGE) -> list[str]:
     return urls[: max(0, int(limit or 0))]
 
 
-def _looks_like_diskwala(url: str) -> bool:
+def _looks_like_terabox(url: str) -> bool:
     u = (url or "").lower()
-    return any(x in u for x in DISKWALA_DOMAIN_KEYWORDS)
+    return any(x in u for x in TERABOX_DOMAIN_KEYWORDS)
 
 
-def _supported_diskwala_domains_text() -> str:
-    return "\n".join(f"- {domain}" for domain in SUPPORTED_DISKWALA_DOMAINS)
+def _supported_terabox_domains_text() -> str:
+    return "\n".join(f"- {domain}" for domain in SUPPORTED_TERABOX_DOMAINS)
 
 
 def _is_livegram_noise(text: str) -> bool:
@@ -1022,74 +1041,12 @@ def _file_caption(name: str, size_mb: float) -> str:
     return (
         f"📁 {name}\n"
         f"{size_line}\n\n"
-        f"⚠️ This file will be deleted automatically in 45 minutes (copyright)."
+        f"⚠️ This file/message will be deleted automatically in 45 minutes (copyright)."
     )
-
-
-def _file_options_caption(name: str, size_mb: float, *, has_stream: bool = False) -> str:
-    size_line = f"📦 {size_mb} MB" if size_mb and size_mb > 0 else "📦 Size unknown"
-    lines = [
-        f"📁 {name}",
-        size_line,
-        "",
-        # Get File disabled — download/upload too slow; Watch Online only
-        # "Choose an option:",
-        # "1️⃣ Get File — sent here (auto-deleted in 45 min)",
-        "▶️ Watch Online — stream in web app",
-    ]
-    # if has_stream and PUBLIC_BASE_URL:
-    #     lines.append("2️⃣ Watch Online — stream in web app")
-    # if size_mb > TELEGRAM_MAX_UPLOAD_MB:
-    #     lines.append(
-    #         f"\n⚠️ File exceeds Telegram upload limit ({TELEGRAM_MAX_UPLOAD_MB:.0f} MB). "
-    #         "Use Watch Online if Get File fails."
-    #     )
-    if not (has_stream and PUBLIC_BASE_URL):
-        lines.append("\n⚠️ Online streaming is currently unavailable for this file.")
-    return "\n".join(lines)
-
-
-def _build_file_options_markup(
-    file_token: str,
-    *,
-    stream: str,
-    name: str,
-    size_mb: float,
-    download_url: str,
-) -> InlineKeyboardMarkup | None:
-    rows = []
-    # Get File disabled — download/upload too slow; keep for later restore
-    # if _is_valid_http_url(download_url):
-    #     rows.append([InlineKeyboardButton(
-    #         "📥 Get File (45 min)",
-    #         callback_data=f"gfile:{file_token}",
-    #     )])
-    if stream and PUBLIC_BASE_URL:
-        stoken = create_stream_token(
-            stream, name=name, size_mb=size_mb, download_url=download_url or "", quality="480p",
-        )
-        web_app_url = f"{PUBLIC_BASE_URL}/player/{stoken}"
-        if _is_valid_https_url(web_app_url):
-            rows.append([InlineKeyboardButton(
-                "▶️ Watch Online (Web App)",
-                web_app=WebAppInfo(url=web_app_url),
-            )])
-    return InlineKeyboardMarkup(rows) if rows else None
 
 
 def _expired_text() -> str:
     return "🗑️ Deleted / expired after 45 minutes (copyright)."
-
-
-def _schedule_delete_message(client: Client, chat_id: int, message_id: int) -> None:
-    async def _runner():
-        await asyncio.sleep(AUTO_DELETE_SECONDS)
-        try:
-            await client.delete_messages(chat_id, message_id)
-        except Exception:
-            pass
-
-    asyncio.create_task(_runner())
 
 
 def _schedule_delete_payment_post_in(client: Client, chat_id: int, message_id: int, delay_seconds: int) -> None:
@@ -1447,7 +1404,7 @@ async def _reply_invalid_link_once(client: Client, message, user_id: int) -> boo
         user["last_invalid_link_ts"] = now
         user_data[user_id] = user
 
-    await message.reply("Send a valid DiskWala link (you can send up to 3 links at once).")
+    await message.reply("Send a valid TeraBox link (you can send up to 3 links at once).")
     return True
 
 
@@ -1521,97 +1478,6 @@ def create_stream_token(stream_url: str, name: str = "", size_mb: float = 0.0,
     return token
 
 
-FILE_TOKEN_TTL_SECONDS = 30 * 60  # 30 minutes to choose Get File
-
-
-def create_file_token(
-    link: str,
-    name: str,
-    size_mb: float,
-    stream: str,
-    user_id: int,
-) -> str:
-    _cleanup_expired_tokens()
-    token = "".join(random.choices(string.ascii_letters + string.digits, k=16))
-    file_tokens[token] = {
-        "link": link,
-        "name": name,
-        "size_mb": size_mb,
-        "stream": stream,
-        "user_id": int(user_id),
-        "expires_at": _now_ts() + FILE_TOKEN_TTL_SECONDS,
-    }
-    return token
-
-
-def _transfer_progress_text(
-    *,
-    name: str,
-    size_mb: float,
-    phase: str,
-    current: int,
-    total: int,
-    speed_bps: float,
-    elapsed: float,
-    cancelled: bool = False,
-    finished: bool = False,
-    error: str = "",
-) -> str:
-    size_line = f"📦 {size_mb} MB" if size_mb and size_mb > 0 else "📦 Size unknown"
-    lines = [f"📁 {name}", size_line, ""]
-
-    if cancelled and finished:
-        lines.append("⏹ Transfer cancelled.")
-    elif error:
-        lines.append(f"❌ {error}")
-    elif finished:
-        lines.append("✅ File sent. It will be deleted in 45 minutes.")
-    else:
-        lines.append(f"⏳ {phase}...")
-        if total > 0:
-            pct = min(100.0, (current / total) * 100)
-            lines.append(f"Progress: {_human_size(current)} / {_human_size(total)} ({pct:.1f}%)")
-        elif current > 0:
-            lines.append(f"Transferred: {_human_size(current)}")
-        if speed_bps > 0:
-            lines.append(f"Speed: {_human_size(speed_bps)}/s")
-        if total > 0 and current > 0 and current < total and speed_bps > 0:
-            eta = (total - current) / speed_bps
-            lines.append(f"ETA: ~{_format_duration(eta)}")
-        lines.append(f"Elapsed: {_format_duration(elapsed)}")
-
-    return "\n".join(lines)
-
-
-class TransferCancelled(Exception):
-    pass
-
-
-async def download_file_with_progress(
-    url: str,
-    path: str,
-    *,
-    cancel_event: asyncio.Event,
-    total_bytes: int = 0,
-    on_progress=None,
-) -> None:
-    timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=120)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url) as resp:
-            resp.raise_for_status()
-            if not total_bytes:
-                total_bytes = int(resp.headers.get("Content-Length", 0) or 0)
-            downloaded = 0
-            with open(path, "wb") as f:
-                async for chunk in resp.content.iter_chunked(1024 * 1024):
-                    if cancel_event.is_set():
-                        raise TransferCancelled()
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if on_progress:
-                        await on_progress(downloaded, total_bytes)
-
-
 # ===== API CALL =====
 def _parse_size_string_to_mb(size_str: str) -> float:
     m = re.match(r'\s*([\d.]+)\s*([KMGT]?B)', size_str or "", re.I)
@@ -1623,171 +1489,154 @@ def _parse_size_string_to_mb(size_str: str) -> float:
     return round(val * mult, 2)
 
 
-def _normalize_diskwala_filename(data: dict) -> str:
-    name = (data.get("name") or "file").strip()
-    ext = (data.get("extension") or "bin").strip().lstrip(".")
-    if ext and not name.lower().endswith(f".{ext.lower()}"):
-        return f"{name}.{ext}"
-    return name or f"file.{ext}"
+def _extract_terabox_hash(url: str) -> str:
+    u = (url or "").strip()
+    m = re.search(r'/s/([A-Za-z0-9_-]+)', u)
+    if m:
+        return m.group(1)
+    qs = urlparse(u).query
+    m2 = re.search(r'surl=([A-Za-z0-9_-]+)', qs)
+    if m2:
+        h = m2.group(1)
+        return h if h.startswith("1") else f"1{h}"
+    return ""
 
 
-async def fetch_diskwala_link(url: str) -> tuple[dict | None, str]:
-    if not DISKWALA_API_KEY:
-        return None, "DiskWala API key is not configured."
-
+async def _call_api1(url: str) -> dict | None:
+    """Free API #1: terabox-api-sable.vercel.app"""
+    endpoint = f"https://terabox-api-sable.vercel.app/terabox_video_streamv3?url={quote_plus(url)}"
     try:
-        timeout = aiohttp.ClientTimeout(total=30)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(
-                f"{DISKWALA_API_BASE}/",
-                params={"url": url, "key": DISKWALA_API_KEY},
-            ) as resp:
+        timeout = aiohttp.ClientTimeout(total=20)
+        ssl_context = _ssl_context_with_certifi()
+        connector = aiohttp.TCPConnector(ssl=ssl_context) if ssl_context else aiohttp.TCPConnector()
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+            async with session.get(endpoint) as resp:
                 if resp.status != 200:
-                    _record_api_result("diskwala", False, f"HTTP {resp.status}")
-                    return None, f"API error HTTP {resp.status}"
+                    _record_api_result("api1", False, f"HTTP {resp.status}")
+                    return None
                 data = await resp.json(content_type=None)
     except Exception as e:
-        _record_api_result("diskwala", False, f"{type(e).__name__}: {e}")
-        return None, "Failed to fetch data."
+        _record_api_result("api1", False, f"{type(e).__name__}: {e}")
+        return None
 
-    if not isinstance(data, dict):
-        _record_api_result("diskwala", False, "invalid response")
-        return None, "Failed to fetch data."
+    if not data or not data.get("success"):
+        _record_api_result("api1", False, (data or {}).get("message") or "success=false")
+        return None
 
-    direct_url = (data.get("direct_url") or "").strip()
-    if not direct_url:
-        api_msg = data.get("message") or data.get("error") or "No direct url in response."
-        _record_api_result("diskwala", False, str(api_msg))
-        return None, str(api_msg)
-
-    size_bytes = int(data.get("size") or 0)
-    full_name = _normalize_diskwala_filename(data)
-    thumbnail = (data.get("thumbnail") or "").strip()
-    media_type = (data.get("type") or "").lower()
-    stream = direct_url if media_type.startswith("video") else ""
-
-    _record_api_result("diskwala", True)
+    _record_api_result("api1", True)
+    fast_streams = data.get("fast_streams") or {}
+    stream = fast_streams.get("480p") or data.get("stream_url") or ""
     return {
-        "name": full_name,
-        "size_mb": round(size_bytes / 1024 / 1024, 2),
-        "link": direct_url,
+        "name": data.get("filename") or "file",
+        "size_mb": _parse_size_string_to_mb(data.get("size") or ""),
+        "link": data.get("download_url") or "",
         "stream": stream,
-        "thumbnail": thumbnail,
-        "source": "diskwala",
-    }, ""
+        "thumbnail": data.get("thumbnail") or "",
+        "source": "api1",
+    }
 
 
-# ===== DOWNLOAD =====
-async def _run_get_file_transfer(
-    client: Client,
-    *,
-    chat_id: int,
-    progress_msg_id: int,
-    job_id: str,
-    link: str,
-    name: str,
-    size_mb: float,
-) -> None:
-    cancel_event = _file_transfer_jobs[job_id]["cancel"]
-    cancel_markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏹ Cancel", callback_data=f"gfcancel:{job_id}")]
-    ])
-    started = time.monotonic()
-    last_edit = 0.0
-    last_bytes = 0
-    last_tick = started
-    current = 0
-    total = int(size_mb * 1024 * 1024) if size_mb > 0 else 0
-    phase = "Downloading"
+async def _call_api2(url: str) -> dict | None:
+    """Free API #2: hostingersite tera.php - only accepts 1024terabox.com links."""
+    target_url = url
+    if "1024terabox.com" not in url.lower():
+        h = _extract_terabox_hash(url)
+        if not h:
+            _record_api_result("api2", False, "could not extract hash from url")
+            return None
+        target_url = f"https://1024terabox.com/s/{h}"
 
-    async def _refresh(force: bool = False, **extra):
-        nonlocal last_edit, last_bytes, last_tick, current, total, phase
-        now = time.monotonic()
-        dt = max(now - last_tick, 0.001)
-        speed = max(0, current - last_bytes) / dt if not extra.get("finished") else 0
-        if not force and (now - last_edit) < 1.5 and not extra.get("finished"):
-            last_bytes = current
-            last_tick = now
-            return
-        text = _transfer_progress_text(
-            name=name,
-            size_mb=size_mb,
-            phase=phase,
-            current=current,
-            total=total,
-            speed_bps=speed,
-            elapsed=now - started,
-            **extra,
-        )
-        markup = None if extra.get("finished") or extra.get("cancelled") or extra.get("error") else cancel_markup
-        try:
-            await client.edit_message_text(chat_id, progress_msg_id, text, reply_markup=markup)
-        except MessageNotModified:
-            pass
-        except Exception:
-            pass
-        last_edit = now
-        last_bytes = current
-        last_tick = now
+    endpoint = f"https://gold-newt-367030.hostingersite.com/tera.php?url={quote_plus(target_url)}"
+    try:
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(endpoint) as resp:
+                if resp.status != 200:
+                    _record_api_result("api2", False, f"HTTP {resp.status}")
+                    return None
+                data = await resp.json(content_type=None)
+    except Exception as e:
+        _record_api_result("api2", False, f"{type(e).__name__}: {e}")
+        return None
 
-    async def _on_download_progress(done: int, file_total: int):
-        nonlocal current, total
-        current = done
-        if file_total > 0:
-            total = file_total
-        await _refresh()
+    if not data or not data.get("success"):
+        _record_api_result("api2", False, (data or {}).get("message") or "success=false")
+        return None
 
-    os.makedirs("downloads", exist_ok=True)
-    safe_name = re.sub(r'[<>:"/\\|?*]', "_", name) or "file.bin"
-    path = f"downloads/{job_id}_{safe_name}"
+    _record_api_result("api2", True)
+    return {
+        "name": data.get("title") or "file",
+        "size_mb": 0.0,
+        "link": "",
+        "stream": data.get("play_url") or "",
+        "thumbnail": data.get("thumbnail") or "",
+        "source": "api2",
+    }
+
+
+async def get_data(url):
+    api_url = "https://xapiverse.com/api/terabox"
+
+    headers = {
+        "Content-Type": "application/json",
+        "xAPIverse-Key": TERABOX_API_KEY
+    }
+
+    payload = {"url": url}
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(api_url, json=payload, headers=headers) as resp:
+            return await resp.json()
+
+
+def _normalize_xverse(data: dict | None) -> dict | None:
+    if not data or data.get("status") != "success":
+        return None
+    file = (data.get("list") or [{}])[0]
+    size = int(file.get("size", 0))
+    return {
+        "name": file.get("name", "file"),
+        "size_mb": round(size / 1024 / 1024, 2),
+        "link": file.get("normal_dlink") or "",
+        "stream": (file.get("fast_stream_url") or {}).get("480p") or file.get("normal_dlink") or "",
+        "thumbnail": file.get("thumbnail") or "",
+        "source": "xverse",
+    }
+
+
+async def fetch_terabox_link(url: str) -> tuple[dict | None, str]:
+    """
+    Tries free API #1, then free API #2, then falls back to the paid xverse API.
+    Returns (normalized_data, "") on success, or (None, error_message) on failure.
+    """
+    try:
+        r1 = await _call_api1(url)
+        if r1:
+            return r1, ""
+    except Exception:
+        pass
 
     try:
-        await _refresh(force=True)
-        await download_file_with_progress(
-            link,
-            path,
-            cancel_event=cancel_event,
-            total_bytes=total,
-            on_progress=_on_download_progress,
-        )
-        if cancel_event.is_set():
-            raise TransferCancelled()
+        r2 = await _call_api2(url)
+        if r2:
+            return r2, ""
+    except Exception:
+        pass
 
-        file_size = os.path.getsize(path)
-        phase = "Uploading"
-        current = 0
-        total = file_size
-        await _refresh(force=True)
-
-        async def _on_upload_progress(sent: int, file_total: int):
-            nonlocal current, total
-            if cancel_event.is_set():
-                raise TransferCancelled()
-            current = sent
-            if file_total > 0:
-                total = file_total
-            await _refresh()
-
-        sent = await client.send_document(
-            chat_id,
-            path,
-            caption=_file_caption(name, size_mb),
-            progress=_on_upload_progress,
-        )
-        _schedule_delete_message(client, sent.chat.id, sent.id)
-        await _refresh(force=True, finished=True)
-    except TransferCancelled:
-        await _refresh(force=True, cancelled=True, finished=True)
+    try:
+        xverse_data = await get_data(url)
     except Exception as e:
-        await _refresh(force=True, error="Transfer failed. Please try again.", finished=True)
-        await report_error(client, "get_file_transfer", e, extra={"user_id": _file_transfer_jobs.get(job_id, {}).get("user_id")})
-    finally:
-        _file_transfer_jobs.pop(job_id, None)
-        if os.path.exists(path):
-            try:
-                os.remove(path)
-            except Exception:
-                pass
+        _record_api_result("xverse", False, f"{type(e).__name__}: {e}")
+        return None, "Failed to fetch data."
+
+    norm = _normalize_xverse(xverse_data)
+    if norm:
+        _record_api_result("xverse", True)
+        return norm, ""
+
+    api_msg = (xverse_data or {}).get("message") or "Failed to fetch data."
+    _record_api_result("xverse", False, api_msg)
+    return None, api_msg
 
 
 async def send_premium_menu(message, user_id: int):
@@ -1897,9 +1746,9 @@ async def start(client, message):
                 f"Congrants ✅ Ad Unlocked ! \n\nYou got more +{LIMIT_FREE_REQUESTS} downloads Limit")
 
     await message.reply(
-        "Welcome to DiskWala Downloader from @BotsXP |\n\n"
-        "Send DiskWala links to get started.\n\n"
-        f"Supported domains:\n{_supported_diskwala_domains_text()}"
+        "Welcome to Tera Downloader from @BotsXP |\n\n"
+        "Send TeraBox links to get started.\n\n"
+        f"Supported domains:\n{_supported_terabox_domains_text()}"
     )
 
 
@@ -2089,76 +1938,11 @@ async def broadcast_cmd(client, message):
 
 
 # ===== MAIN HANDLER =====
-@app.on_message(filters.command("usage"))
-async def usage_cmd(client, message):
-    user_id = message.from_user.id
-    await _upsert_user_profile(message.from_user, client.bot_key)
-    if int(user_id) not in ADMIN_USER_IDS:
-        return await message.reply("❌ You are not allowed to use this command.")
-    if not DISKWALA_API_KEY:
-        return await message.reply("DISKWALA_API_KEY is not configured.")
-
-    status = await message.reply("Fetching usage info...")
-    try:
-        timeout = aiohttp.ClientTimeout(total=30)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(
-                f"{DISKWALA_API_BASE}/usage",
-                params={"key": DISKWALA_API_KEY},
-            ) as resp:
-                resp.raise_for_status()
-                data = await resp.json(content_type=None)
-    except Exception as e:
-        return await status.edit(f"Failed to fetch usage: {e}")
-
-    await status.edit(_format_api_usage(data))
-
-
-def _human_size(n):
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024:
-            return f"{n:.2f}{unit}"
-        n /= 1024
-    return f"{n:.2f}TB"
-
-
-def _format_usage_value(key, value):
-    key_lower = key.lower()
-    if any(part in key_lower for part in ("key", "token", "secret", "password")):
-        return "***"
-    if isinstance(value, (int, float)) and any(
-        part in key_lower for part in ("size", "bytes", "bandwidth", "traffic", "storage")
-    ):
-        return _human_size(value)
-    return str(value)
-
-
-def _format_api_usage(data: dict) -> str:
-    if not data:
-        return "Usage info is empty."
-
-    lines = ["Usage:"]
-
-    def add_items(items, prefix=""):
-        for key, value in items.items():
-            label = f"{prefix}{str(key).replace('_', ' ').title()}"
-            if isinstance(value, dict):
-                lines.append(f"{label}:")
-                add_items(value, prefix="  ")
-            elif isinstance(value, list):
-                lines.append(f"{label}: {', '.join(map(str, value)) if value else 'None'}")
-            else:
-                lines.append(f"{label}: {_format_usage_value(str(key), value)}")
-
-    add_items(data)
-    return "\n".join(lines)
-
-
 @app.on_message(filters.private & ~filters.command([
-    "start", "premium", "myplan", "status", "usage", "broadcast",
+    "start", "premium", "myplan", "status", "broadcast",
     "shortlink_on", "shortlink_off", "freemode_on", "freemode_off",
 ]))
-async def diskwala(client, message):
+async def terabox(client, message):
     user_id = message.from_user.id
     await _upsert_user_profile(message.from_user, client.bot_key)
 
@@ -2189,13 +1973,13 @@ async def diskwala(client, message):
 
     try:
         urls = extract_urls(message, limit=MAX_LINKS_PER_MESSAGE)
-        diskwala_urls = [u for u in urls if _looks_like_diskwala(u)]
+        terabox_urls = [u for u in urls if _looks_like_terabox(u)]
 
-        if not diskwala_urls:
+        if not terabox_urls:
             await _reply_invalid_link_once(client, message, user_id)
             return
 
-        for idx, url in enumerate(diskwala_urls[:MAX_LINKS_PER_MESSAGE], start=1):
+        for idx, url in enumerate(terabox_urls[:MAX_LINKS_PER_MESSAGE], start=1):
             skip_quota = FREE_MODE_ENABLED
             if skip_quota:
                 ok_credit, is_premium, daily_limit = True, True, 0
@@ -2214,8 +1998,8 @@ async def diskwala(client, message):
                         await send_premium_required_once(client, message, user_id)
                 return
 
-            msg = await message.reply(f"Fetching ({idx}/{len(diskwala_urls[:MAX_LINKS_PER_MESSAGE])})...")
-            result, err_msg = await fetch_diskwala_link(url)
+            msg = await message.reply(f"Fetching ({idx}/{len(terabox_urls[:MAX_LINKS_PER_MESSAGE])})...")
+            result, err_msg = await fetch_terabox_link(url)
 
             if not result:
                 await msg.edit(
@@ -2233,34 +2017,42 @@ async def diskwala(client, message):
             stream = result["stream"]
             thumbnail = result["thumbnail"]
 
-            ftoken = create_file_token(link, name, size_mb, stream, user_id)
-            caption = _file_options_caption(name, size_mb, has_stream=bool(stream))
-            markup = _build_file_options_markup(
-                ftoken,
-                stream=stream,
-                name=name,
-                size_mb=size_mb,
-                download_url=link,
-            )
+            # credit already reserved above (atomic)
+            # Watch Online only — never download/upload files (saves bandwidth for any size).
+            buttons = []
+            if stream and PUBLIC_BASE_URL:
+                stoken = create_stream_token(stream, name=name, size_mb=size_mb,
+                                             download_url=link or "", quality="480p")
+                web_app_url = f"{PUBLIC_BASE_URL}/player/{stoken}"
+                if _is_valid_https_url(web_app_url):
+                    buttons.append([
+                        InlineKeyboardButton(
+                            "▶️ Watch Online",
+                            web_app=WebAppInfo(url=web_app_url),
+                        )
+                    ])
 
-            if not markup:
+            if not buttons:
                 await msg.edit(
-                    f"📁 {name}\n📦 {size_mb} MB\n\n⚠️ No delivery options available.",
+                    f"📁 {name}\n📦 {size_mb} MB\n\n⚠️ No valid stream URL returned.",
                     reply_markup=_support_markup(),
                 )
                 continue
 
+            caption = _file_caption(name, size_mb)
+            markup = InlineKeyboardMarkup(buttons)
+
             if thumbnail and _is_valid_http_url(thumbnail):
-                try:
-                    await msg.delete()
-                except Exception:
-                    pass
                 info = await client.send_photo(
                     message.chat.id,
                     photo=thumbnail.strip(),
                     caption=caption,
                     reply_markup=markup,
                 )
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
                 _schedule_expire_media_message(client, info.chat.id, info.id)
             else:
                 await msg.edit(
@@ -2270,7 +2062,7 @@ async def diskwala(client, message):
                 _schedule_disable_and_mark_expired(client, msg.chat.id, msg.id, is_caption=False)
 
     except Exception as e:
-        await report_error(client, "diskwala_handler", e, extra={"user_id": user_id})
+        await report_error(client, "terabox_handler", e, extra={"user_id": user_id})
         try:
             await message.reply(
                 "Something went wrong. Please try again later.",
@@ -2278,73 +2070,6 @@ async def diskwala(client, message):
             )
         except Exception:
             pass
-
-
-@app.on_callback_query(filters.regex(r"^gfile:([a-zA-Z0-9]{16})$"))
-async def get_file_cb(client, callback_query):
-    user_id = callback_query.from_user.id
-    token = callback_query.data.split(":", 1)[1]
-    data = file_tokens.get(token)
-    if not data or data.get("expires_at", 0) <= _now_ts():
-        return await callback_query.answer("Session expired. Send the link again.", show_alert=True)
-    if int(data.get("user_id", 0)) != user_id:
-        return await callback_query.answer("Not your request.", show_alert=True)
-
-    link = (data.get("link") or "").strip()
-    name = data.get("name") or "file"
-    size_mb = float(data.get("size_mb") or 0)
-
-    if size_mb > TELEGRAM_MAX_UPLOAD_MB:
-        return await callback_query.answer(
-            f"File exceeds Telegram limit ({TELEGRAM_MAX_UPLOAD_MB:.0f} MB). Use Watch Online.",
-            show_alert=True,
-        )
-    if not _is_valid_http_url(link):
-        return await callback_query.answer("File URL unavailable.", show_alert=True)
-
-    await callback_query.answer("Starting…")
-
-    job_id = "".join(random.choices("0123456789abcdef", k=8))
-    _file_transfer_jobs[job_id] = {"cancel": asyncio.Event(), "user_id": user_id}
-    est_total = int(size_mb * 1024 * 1024) if size_mb > 0 else 0
-
-    progress_msg = await callback_query.message.reply(
-        _transfer_progress_text(
-            name=name,
-            size_mb=size_mb,
-            phase="Preparing",
-            current=0,
-            total=est_total,
-            speed_bps=0,
-            elapsed=0,
-        ),
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⏹ Cancel", callback_data=f"gfcancel:{job_id}")]
-        ]),
-    )
-
-    asyncio.create_task(_run_get_file_transfer(
-        client,
-        chat_id=progress_msg.chat.id,
-        progress_msg_id=progress_msg.id,
-        job_id=job_id,
-        link=link,
-        name=name,
-        size_mb=size_mb,
-    ))
-
-
-@app.on_callback_query(filters.regex(r"^gfcancel:([a-f0-9]{8})$"))
-async def get_file_cancel_cb(client, callback_query):
-    user_id = callback_query.from_user.id
-    job_id = callback_query.data.split(":", 1)[1]
-    job = _file_transfer_jobs.get(job_id)
-    if not job:
-        return await callback_query.answer("Nothing to cancel.", show_alert=False)
-    if int(job.get("user_id", 0)) != user_id:
-        return await callback_query.answer("Not allowed.", show_alert=True)
-    job["cancel"].set()
-    await callback_query.answer("Cancelling…", show_alert=False)
 
 
 @app.on_callback_query(filters.regex(r"^bcancel:([a-f0-9]{8})$"))
@@ -2380,7 +2105,7 @@ async def check_join_cb(client, callback_query):
 
     if is_joined:
         try:
-            await callback_query.message.edit_text("✅ Verified! Now send your DiskWala link.")
+            await callback_query.message.edit_text("✅ Verified! Now send your TeraBox link.")
         except ChatWriteForbidden:
             pass
         await callback_query.answer("Verified ✅", show_alert=False)
@@ -2781,7 +2506,7 @@ async def premium_checkout(pay_token: str):
       key: {RAZORPAY_KEY_ID!r},
       amount: {int(plan['amount_inr']) * 100},
       currency: "INR",
-      name: "DiskWala DL Premium",
+      name: "TeraDL Premium",
       description: "{plan['label']} plan",
       order_id: {order_id!r},
       prefill: {{}},
@@ -3077,7 +2802,7 @@ async def player(token: str):
     file_name = html.escape(data.get("name") or "video.mp4")
     size_mb = data.get("size_mb") or 0
     quality = html.escape(data.get("quality") or "")
-    bot_username = html.escape(_current_bot_username() or "DiskWalaBot")
+    bot_username = html.escape(_current_bot_username() or "TeraBot")
     loot_deals_url = "https://t.me/+SVbNsGtmvfUzYzNl"
 
     page = f"""<!doctype html>
@@ -3188,7 +2913,7 @@ async def player(token: str):
 
       <div class="hint">
         <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
-        <div>If playback fails, the source may be temporarily unavailable.<br>Try again later.</div>
+        <div>If playback fails, the source may be temporarily unavailable.<br>Try again later from the bot.</div>
       </div>
 
       <div class="promo">
@@ -3307,7 +3032,7 @@ async def hls_proxy():
 
 @bot.get("/health")
 async def health():
-    return {"ok": True, "service": "diskwala-downloader-bot"}, 200
+    return {"ok": True, "service": "teradl-bot"}, 200
 
 
 @bot.before_serving
