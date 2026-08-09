@@ -25,6 +25,7 @@ from pyrogram.errors import (
     InputUserDeactivated,
     PeerIdInvalid,
     MessageNotModified,
+    WebpageMediaEmpty,
 )
 from pyrogram.enums import ChatMemberStatus
 import aiohttp
@@ -46,6 +47,8 @@ except Exception:
 load_dotenv()
 BOT_BOOT_TIME_UTC = datetime.now(timezone.utc)
 
+# Telegram allows bots to upload up to 2 GB; override via TELEGRAM_MAX_UPLOAD_MB if needed.
+TELEGRAM_MAX_UPLOAD_MB = float(os.getenv("TELEGRAM_MAX_UPLOAD_MB", "2048"))
 LIMIT_FREE_REQUESTS = 3
 UNLOCK_TOKEN_TTL_SECONDS = 60 * 60  # 1 hour to use the unlock token
 STREAM_TOKEN_TTL_SECONDS = 15 * 60  # 15 minutes
@@ -158,6 +161,8 @@ user_locks: dict[int, asyncio.Lock] = {}
 tokens: dict[str, dict] = {}
 # stream_token -> {"url": str, "expires_at": float}
 stream_tokens: dict[str, dict] = {}
+# file_token -> pending Get File request metadata
+file_tokens: dict[str, dict] = {}
 payment_tokens: dict[str, dict] = {}
 
 mongo_client = None
@@ -168,10 +173,13 @@ premium_reminder_task = None
 _force_sub_warned = False
 # broadcast job_id -> {"cancel": asyncio.Event, "admin_id": int}
 _broadcast_jobs: dict[str, dict] = {}
+# transfer job_id -> {"cancel": asyncio.Event, "user_id": int}
+_file_transfer_jobs: dict[str, dict] = {}
 
 # In-memory admin toggles (not persisted; reset on restart)
 QUOTA_ENABLED = True  # /shortlink_on|off - when False, free users must buy premium after free quota
 FREE_MODE_ENABLED = False  # /freemode_on|off - when True, bot is free for everyone
+SENDFILE_ENABLED = True  # /sendfile_on|off - when False, Get File (Premium) shows admin-disabled popup
 
 # In-memory per-API usage/health counters (not persisted; reset on restart).
 # api_key -> {attempts, success, fail, consecutive_fails, last_ok_at, last_fail_at, last_error}
@@ -218,6 +226,8 @@ def _cleanup_expired_tokens() -> None:
         stream_tokens.pop(t, None)
     for t in [k for k, v in payment_tokens.items() if v.get("expires_at", 0) <= now]:
         payment_tokens.pop(t, None)
+    for t in [k for k, v in file_tokens.items() if v.get("expires_at", 0) <= now]:
+        file_tokens.pop(t, None)
 
 
 def _utc_now() -> datetime:
@@ -246,9 +256,20 @@ async def _get_premium_until(user_id: int) -> datetime | None:
     return None
 
 
+def _is_admin_user(user_id: int) -> bool:
+    return int(user_id) in ADMIN_USER_IDS
+
+
 async def _is_premium_user(user_id: int) -> bool:
     premium_until = await _get_premium_until(user_id)
     return bool(premium_until and premium_until > _utc_now())
+
+
+async def _has_premium_access(user_id: int) -> bool:
+    """Premium subscribers and env-configured admins get premium-only features."""
+    if _is_admin_user(user_id):
+        return True
+    return await _is_premium_user(user_id)
 
 
 async def _upsert_user_profile(user, bot_key: str) -> None:
@@ -522,6 +543,9 @@ async def _status_text(bot_key: str) -> str:
             f"Total users: {total_users}\n"
             "Premium users: DB not enabled\n"
             f"In-memory users today: {total_users}\n\n"
+            f"Toggles: quota={'on' if QUOTA_ENABLED else 'off'} | "
+            f"freemode={'on' if FREE_MODE_ENABLED else 'off'} | "
+            f"sendfile={'on' if SENDFILE_ENABLED else 'off'}\n\n"
             f"{api_text}"
         )
     now = _utc_now()
@@ -535,6 +559,9 @@ async def _status_text(bot_key: str) -> str:
         f"Premium active users: {premium_users}\n"
         f"Premium expired users: {expired_premium_users}\n"
         f"Active users (last 24h): {active_today}\n\n"
+        f"Toggles: quota={'on' if QUOTA_ENABLED else 'off'} | "
+        f"freemode={'on' if FREE_MODE_ENABLED else 'off'} | "
+        f"sendfile={'on' if SENDFILE_ENABLED else 'off'}\n\n"
         f"{api_text}"
     )
 
@@ -1045,8 +1072,111 @@ def _file_caption(name: str, size_mb: float) -> str:
     )
 
 
+def _file_options_caption(name: str, size_mb: float, *, has_stream: bool = False) -> str:
+    size_line = f"📦 {size_mb} MB" if size_mb and size_mb > 0 else "📦 Size unknown"
+    lines = [
+        f"📁 {name}",
+        size_line,
+        "",
+        "Choose an option:",
+    ]
+    if has_stream and PUBLIC_BASE_URL:
+        lines.append("▶️ Watch Now (Free) — stream in web app")
+    else:
+        lines.append("▶️ Watch Now (Free) — unavailable for this file")
+    lines.append("📥 Get File (Premium) — sent here (auto-deleted in 45 min)")
+    if size_mb > TELEGRAM_MAX_UPLOAD_MB:
+        lines.append(
+            f"\n⚠️ File exceeds Telegram upload limit ({TELEGRAM_MAX_UPLOAD_MB:.0f} MB). "
+            "Use Watch Now if Get File fails."
+        )
+    return "\n".join(lines)
+
+
+def _build_file_options_markup(
+    file_token: str,
+    *,
+    stream: str,
+    name: str,
+    size_mb: float,
+    download_url: str,
+) -> InlineKeyboardMarkup | None:
+    rows = []
+    if stream and PUBLIC_BASE_URL:
+        stoken = create_stream_token(
+            stream, name=name, size_mb=size_mb, download_url=download_url or "", quality="480p",
+        )
+        web_app_url = f"{PUBLIC_BASE_URL}/player/{stoken}"
+        if _is_valid_https_url(web_app_url):
+            rows.append([InlineKeyboardButton(
+                "▶️ Watch Now (Free)",
+                web_app=WebAppInfo(url=web_app_url),
+            )])
+    if _is_valid_http_url(download_url):
+        rows.append([InlineKeyboardButton(
+            "📥 Get File (Premium)",
+            callback_data=f"gfile:{file_token}",
+        )])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def _send_file_options_message(
+    client: Client,
+    message,
+    msg,
+    *,
+    caption: str,
+    markup: InlineKeyboardMarkup,
+    thumbnail: str,
+) -> None:
+    """Send file options; use thumbnail when valid, otherwise fall back to text-only."""
+    if thumbnail and _is_valid_http_url(thumbnail):
+        deleted_fetch_msg = False
+        try:
+            await msg.delete()
+            deleted_fetch_msg = True
+        except Exception:
+            pass
+        try:
+            info = await client.send_photo(
+                message.chat.id,
+                photo=thumbnail.strip(),
+                caption=caption,
+                reply_markup=markup,
+            )
+            _schedule_expire_media_message(client, info.chat.id, info.id)
+            return
+        except (WebpageMediaEmpty, Exception):
+            if deleted_fetch_msg:
+                msg = None
+
+    if msg is not None:
+        try:
+            await msg.edit(caption, reply_markup=markup)
+            _schedule_disable_and_mark_expired(client, msg.chat.id, msg.id, is_caption=False)
+            return
+        except Exception:
+            pass
+
+    info = await message.reply(caption, reply_markup=markup)
+    _schedule_disable_and_mark_expired(
+        client, info.chat.id, info.id, is_caption=bool(getattr(info, "caption", None)),
+    )
+
+
 def _expired_text() -> str:
     return "🗑️ Deleted / expired after 45 minutes (copyright)."
+
+
+def _schedule_delete_message(client: Client, chat_id: int, message_id: int) -> None:
+    async def _runner():
+        await asyncio.sleep(AUTO_DELETE_SECONDS)
+        try:
+            await client.delete_messages(chat_id, message_id)
+        except Exception:
+            pass
+
+    asyncio.create_task(_runner())
 
 
 def _schedule_delete_payment_post_in(client: Client, chat_id: int, message_id: int, delay_seconds: int) -> None:
@@ -1478,6 +1608,97 @@ def create_stream_token(stream_url: str, name: str = "", size_mb: float = 0.0,
     return token
 
 
+FILE_TOKEN_TTL_SECONDS = 30 * 60  # 30 minutes to choose Get File
+
+
+def create_file_token(
+    link: str,
+    name: str,
+    size_mb: float,
+    stream: str,
+    user_id: int,
+) -> str:
+    _cleanup_expired_tokens()
+    token = "".join(random.choices(string.ascii_letters + string.digits, k=16))
+    file_tokens[token] = {
+        "link": link,
+        "name": name,
+        "size_mb": size_mb,
+        "stream": stream,
+        "user_id": int(user_id),
+        "expires_at": _now_ts() + FILE_TOKEN_TTL_SECONDS,
+    }
+    return token
+
+
+def _transfer_progress_text(
+    *,
+    name: str,
+    size_mb: float,
+    phase: str,
+    current: int,
+    total: int,
+    speed_bps: float,
+    elapsed: float,
+    cancelled: bool = False,
+    finished: bool = False,
+    error: str = "",
+) -> str:
+    size_line = f"📦 {size_mb} MB" if size_mb and size_mb > 0 else "📦 Size unknown"
+    lines = [f"📁 {name}", size_line, ""]
+
+    if cancelled and finished:
+        lines.append("⏹ Transfer cancelled.")
+    elif error:
+        lines.append(f"❌ {error}")
+    elif finished:
+        lines.append("✅ File sent. It will be deleted in 45 minutes.")
+    else:
+        lines.append(f"⏳ {phase}...")
+        if total > 0:
+            pct = min(100.0, (current / total) * 100)
+            lines.append(f"Progress: {_human_size(current)} / {_human_size(total)} ({pct:.1f}%)")
+        elif current > 0:
+            lines.append(f"Transferred: {_human_size(current)}")
+        if speed_bps > 0:
+            lines.append(f"Speed: {_human_size(speed_bps)}/s")
+        if total > 0 and current > 0 and current < total and speed_bps > 0:
+            eta = (total - current) / speed_bps
+            lines.append(f"ETA: ~{_format_duration(eta)}")
+        lines.append(f"Elapsed: {_format_duration(elapsed)}")
+
+    return "\n".join(lines)
+
+
+class TransferCancelled(Exception):
+    pass
+
+
+async def download_file_with_progress(
+    url: str,
+    path: str,
+    *,
+    cancel_event: asyncio.Event,
+    total_bytes: int = 0,
+    on_progress=None,
+) -> None:
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=120)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url) as resp:
+            resp.raise_for_status()
+            if not total_bytes:
+                total_bytes = int(resp.headers.get("Content-Length", 0) or 0)
+            downloaded = 0
+            with open(path, "wb") as f:
+                async for chunk in resp.content.iter_chunked(1024 * 1024):
+                    if cancel_event.is_set():
+                        raise TransferCancelled()
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if on_progress:
+                        await on_progress(downloaded, total_bytes)
+
+
 # ===== API CALL =====
 def _parse_size_string_to_mb(size_str: str) -> float:
     m = re.match(r'\s*([\d.]+)\s*([KMGT]?B)', size_str or "", re.I)
@@ -1639,6 +1860,119 @@ async def fetch_terabox_link(url: str) -> tuple[dict | None, str]:
     return None, api_msg
 
 
+# ===== DOWNLOAD =====
+async def _run_get_file_transfer(
+    client: Client,
+    *,
+    chat_id: int,
+    progress_msg_id: int,
+    job_id: str,
+    link: str,
+    name: str,
+    size_mb: float,
+) -> None:
+    cancel_event = _file_transfer_jobs[job_id]["cancel"]
+    cancel_markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏹ Cancel", callback_data=f"gfcancel:{job_id}")]
+    ])
+    started = time.monotonic()
+    last_edit = 0.0
+    last_bytes = 0
+    last_tick = started
+    current = 0
+    total = int(size_mb * 1024 * 1024) if size_mb > 0 else 0
+    phase = "Downloading"
+
+    async def _refresh(force: bool = False, **extra):
+        nonlocal last_edit, last_bytes, last_tick, current, total, phase
+        now = time.monotonic()
+        dt = max(now - last_tick, 0.001)
+        speed = max(0, current - last_bytes) / dt if not extra.get("finished") else 0
+        if not force and (now - last_edit) < 1.5 and not extra.get("finished"):
+            last_bytes = current
+            last_tick = now
+            return
+        text = _transfer_progress_text(
+            name=name,
+            size_mb=size_mb,
+            phase=phase,
+            current=current,
+            total=total,
+            speed_bps=speed,
+            elapsed=now - started,
+            **extra,
+        )
+        markup = None if extra.get("finished") or extra.get("cancelled") or extra.get("error") else cancel_markup
+        try:
+            await client.edit_message_text(chat_id, progress_msg_id, text, reply_markup=markup)
+        except MessageNotModified:
+            pass
+        except Exception:
+            pass
+        last_edit = now
+        last_bytes = current
+        last_tick = now
+
+    async def _on_download_progress(done: int, file_total: int):
+        nonlocal current, total
+        current = done
+        if file_total > 0:
+            total = file_total
+        await _refresh()
+
+    os.makedirs("downloads", exist_ok=True)
+    safe_name = re.sub(r'[<>:"/\\|?*]', "_", name) or "file.bin"
+    path = f"downloads/{job_id}_{safe_name}"
+
+    try:
+        await _refresh(force=True)
+        await download_file_with_progress(
+            link,
+            path,
+            cancel_event=cancel_event,
+            total_bytes=total,
+            on_progress=_on_download_progress,
+        )
+        if cancel_event.is_set():
+            raise TransferCancelled()
+
+        file_size = os.path.getsize(path)
+        phase = "Uploading"
+        current = 0
+        total = file_size
+        await _refresh(force=True)
+
+        async def _on_upload_progress(sent: int, file_total: int):
+            nonlocal current, total
+            if cancel_event.is_set():
+                raise TransferCancelled()
+            current = sent
+            if file_total > 0:
+                total = file_total
+            await _refresh()
+
+        sent = await client.send_document(
+            chat_id,
+            path,
+            caption=_file_caption(name, size_mb),
+            progress=_on_upload_progress,
+        )
+        _schedule_delete_message(client, sent.chat.id, sent.id)
+        await _refresh(force=True, finished=True)
+    except TransferCancelled:
+        await _refresh(force=True, cancelled=True, finished=True)
+    except Exception as e:
+        await _refresh(force=True, error="Transfer failed. Please try again.", finished=True)
+        await report_error(client, "get_file_transfer", e, extra={"user_id": _file_transfer_jobs.get(job_id, {}).get("user_id")})
+    finally:
+        _file_transfer_jobs.pop(job_id, None)
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+
 async def send_premium_menu(message, user_id: int):
     if not _is_premium_enabled():
         return await message.reply(
@@ -1709,9 +2043,6 @@ async def start(client, message):
             await message.delete()
         except Exception:
             pass
-        return
-
-    if not await _ensure_joined(client, message):
         return
 
     # 🔓 Unlock flow
@@ -1820,6 +2151,28 @@ async def freemode_off_cmd(client, message):
         return await message.reply("❌ You are not allowed to use this command.")
     FREE_MODE_ENABLED = False
     await message.reply("✅ Free mode DISABLED. Normal quota/premium rules apply again.")
+
+
+@app.on_message(filters.command("sendfile_on"))
+async def sendfile_on_cmd(client, message):
+    global SENDFILE_ENABLED
+    user_id = message.from_user.id
+    if int(user_id) not in ADMIN_USER_IDS:
+        return await message.reply("❌ You are not allowed to use this command.")
+    SENDFILE_ENABLED = True
+    await message.reply("✅ Get File (Premium) ENABLED. Premium users can download files again.")
+
+
+@app.on_message(filters.command("sendfile_off"))
+async def sendfile_off_cmd(client, message):
+    global SENDFILE_ENABLED
+    user_id = message.from_user.id
+    if int(user_id) not in ADMIN_USER_IDS:
+        return await message.reply("❌ You are not allowed to use this command.")
+    SENDFILE_ENABLED = False
+    await message.reply(
+        "✅ Get File (Premium) DISABLED. The button stays visible, but users see a temporary-closed popup."
+    )
 
 
 @app.on_message(filters.command("broadcast"))
@@ -1938,9 +2291,73 @@ async def broadcast_cmd(client, message):
 
 
 # ===== MAIN HANDLER =====
+@app.on_message(filters.command("usage"))
+async def usage_cmd(client, message):
+    user_id = message.from_user.id
+    await _upsert_user_profile(message.from_user, client.bot_key)
+    if int(user_id) not in ADMIN_USER_IDS:
+        return await message.reply("❌ You are not allowed to use this command.")
+    if not TERABOX_API_KEY:
+        return await message.reply("XVERSE_API_KEY is not configured.")
+
+    status = await message.reply("Fetching usage info...")
+    try:
+        timeout = aiohttp.ClientTimeout(total=30)
+        headers = {"xAPIverse-Key": TERABOX_API_KEY}
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get("https://xapiverse.com/api/usage", headers=headers) as resp:
+                resp.raise_for_status()
+                data = await resp.json(content_type=None)
+    except Exception as e:
+        return await status.edit(f"Failed to fetch usage: {e}")
+
+    await status.edit(_format_api_usage(data))
+
+
+def _human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.2f}{unit}"
+        n /= 1024
+    return f"{n:.2f}TB"
+
+
+def _format_usage_value(key, value):
+    key_lower = key.lower()
+    if any(part in key_lower for part in ("key", "token", "secret", "password")):
+        return "***"
+    if isinstance(value, (int, float)) and any(
+        part in key_lower for part in ("size", "bytes", "bandwidth", "traffic", "storage")
+    ):
+        return _human_size(value)
+    return str(value)
+
+
+def _format_api_usage(data: dict) -> str:
+    if not data:
+        return "Usage info is empty."
+
+    lines = ["Usage:"]
+
+    def add_items(items, prefix=""):
+        for key, value in items.items():
+            label = f"{prefix}{str(key).replace('_', ' ').title()}"
+            if isinstance(value, dict):
+                lines.append(f"{label}:")
+                add_items(value, prefix="  ")
+            elif isinstance(value, list):
+                lines.append(f"{label}: {', '.join(map(str, value)) if value else 'None'}")
+            else:
+                lines.append(f"{label}: {_format_usage_value(str(key), value)}")
+
+    add_items(data)
+    return "\n".join(lines)
+
+
 @app.on_message(filters.private & ~filters.command([
-    "start", "premium", "myplan", "status", "broadcast",
+    "start", "premium", "myplan", "status", "usage", "broadcast",
     "shortlink_on", "shortlink_off", "freemode_on", "freemode_off",
+    "sendfile_on", "sendfile_off",
 ]))
 async def terabox(client, message):
     user_id = message.from_user.id
@@ -2018,48 +2435,31 @@ async def terabox(client, message):
             thumbnail = result["thumbnail"]
 
             # credit already reserved above (atomic)
-            # Watch Online only — never download/upload files (saves bandwidth for any size).
-            buttons = []
-            if stream and PUBLIC_BASE_URL:
-                stoken = create_stream_token(stream, name=name, size_mb=size_mb,
-                                             download_url=link or "", quality="480p")
-                web_app_url = f"{PUBLIC_BASE_URL}/player/{stoken}"
-                if _is_valid_https_url(web_app_url):
-                    buttons.append([
-                        InlineKeyboardButton(
-                            "▶️ Watch Online",
-                            web_app=WebAppInfo(url=web_app_url),
-                        )
-                    ])
+            ftoken = create_file_token(link, name, size_mb, stream, user_id)
+            caption = _file_options_caption(name, size_mb, has_stream=bool(stream))
+            markup = _build_file_options_markup(
+                ftoken,
+                stream=stream,
+                name=name,
+                size_mb=size_mb,
+                download_url=link,
+            )
 
-            if not buttons:
+            if not markup:
                 await msg.edit(
-                    f"📁 {name}\n📦 {size_mb} MB\n\n⚠️ No valid stream URL returned.",
+                    f"📁 {name}\n📦 {size_mb} MB\n\n⚠️ No delivery options available.",
                     reply_markup=_support_markup(),
                 )
                 continue
 
-            caption = _file_caption(name, size_mb)
-            markup = InlineKeyboardMarkup(buttons)
-
-            if thumbnail and _is_valid_http_url(thumbnail):
-                info = await client.send_photo(
-                    message.chat.id,
-                    photo=thumbnail.strip(),
-                    caption=caption,
-                    reply_markup=markup,
-                )
-                try:
-                    await msg.delete()
-                except Exception:
-                    pass
-                _schedule_expire_media_message(client, info.chat.id, info.id)
-            else:
-                await msg.edit(
-                    caption,
-                    reply_markup=markup,
-                )
-                _schedule_disable_and_mark_expired(client, msg.chat.id, msg.id, is_caption=False)
+            await _send_file_options_message(
+                client,
+                message,
+                msg,
+                caption=caption,
+                markup=markup,
+                thumbnail=thumbnail,
+            )
 
     except Exception as e:
         await report_error(client, "terabox_handler", e, extra={"user_id": user_id})
@@ -2070,6 +2470,87 @@ async def terabox(client, message):
             )
         except Exception:
             pass
+
+
+@app.on_callback_query(filters.regex(r"^gfile:([a-zA-Z0-9]{16})$"))
+async def get_file_cb(client, callback_query):
+    user_id = callback_query.from_user.id
+    token = callback_query.data.split(":", 1)[1]
+    data = file_tokens.get(token)
+    if not data or data.get("expires_at", 0) <= _now_ts():
+        return await callback_query.answer("Session expired. Send the link again.", show_alert=True)
+    if int(data.get("user_id", 0)) != user_id:
+        return await callback_query.answer("Not your request.", show_alert=True)
+
+    if not await _has_premium_access(user_id):
+        return await callback_query.answer(
+            "Get File is a Premium feature. Use /premium to upgrade.",
+            show_alert=True,
+        )
+    if not SENDFILE_ENABLED:
+        return await callback_query.answer(
+            "Admin has temporarily closed Get File. Please try again later.",
+            show_alert=True,
+        )
+
+    link = (data.get("link") or "").strip()
+    name = data.get("name") or "file"
+    size_mb = float(data.get("size_mb") or 0)
+
+    if size_mb > TELEGRAM_MAX_UPLOAD_MB:
+        return await callback_query.answer(
+            f"File exceeds Telegram limit ({TELEGRAM_MAX_UPLOAD_MB:.0f} MB). Use Watch Online.",
+            show_alert=True,
+        )
+    if not _is_valid_http_url(link):
+        return await callback_query.answer("File URL unavailable.", show_alert=True)
+
+    await callback_query.answer("Starting premium file transfer…")
+
+    job_id = "".join(random.choices("0123456789abcdef", k=8))
+    _file_transfer_jobs[job_id] = {"cancel": asyncio.Event(), "user_id": user_id}
+    est_total = int(size_mb * 1024 * 1024) if size_mb > 0 else 0
+    est_eta_note = ""
+    if size_mb > 0:
+        est_eta_note = f"\nEstimated size: {size_mb} MB — speed and ETA update live below."
+
+    progress_msg = await callback_query.message.reply(
+        _transfer_progress_text(
+            name=name,
+            size_mb=size_mb,
+            phase="Preparing",
+            current=0,
+            total=est_total,
+            speed_bps=0,
+            elapsed=0,
+        ) + est_eta_note,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⏹ Cancel", callback_data=f"gfcancel:{job_id}")]
+        ]),
+    )
+
+    asyncio.create_task(_run_get_file_transfer(
+        client,
+        chat_id=progress_msg.chat.id,
+        progress_msg_id=progress_msg.id,
+        job_id=job_id,
+        link=link,
+        name=name,
+        size_mb=size_mb,
+    ))
+
+
+@app.on_callback_query(filters.regex(r"^gfcancel:([a-f0-9]{8})$"))
+async def get_file_cancel_cb(client, callback_query):
+    user_id = callback_query.from_user.id
+    job_id = callback_query.data.split(":", 1)[1]
+    job = _file_transfer_jobs.get(job_id)
+    if not job:
+        return await callback_query.answer("Nothing to cancel.", show_alert=False)
+    if int(job.get("user_id", 0)) != user_id:
+        return await callback_query.answer("Not allowed.", show_alert=True)
+    job["cancel"].set()
+    await callback_query.answer("Cancelling…", show_alert=False)
 
 
 @app.on_callback_query(filters.regex(r"^bcancel:([a-f0-9]{8})$"))
