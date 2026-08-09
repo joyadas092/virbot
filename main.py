@@ -3336,18 +3336,78 @@ async def player(token: str):
       .hint {{ display: flex; gap: 10px; margin: 0 14px 14px; padding: 12px; border-radius: 12px;
         background: #10162494; border: 1px solid #1c2333; font-size: 12px; line-height: 1.5; color: #b9c0d1; }}
       .hint svg {{ width: 16px; height: 16px; stroke: #8b93a7; fill: none; stroke-width: 2; flex-shrink: 0; margin-top: 1px; }}
-      .promo {{ margin: 0 14px 14px; padding: 16px; border-radius: 14px;
-        background: linear-gradient(135deg, #171233, #0f1a33); border: 1px solid #262a52; }}
-      .promo-head {{ display: flex; align-items: center; gap: 10px; }}
-      .promo-head .p-title {{ font-size: 15px; font-weight: 700; flex: 1; }}
-      .promo p {{ font-size: 12.5px; color: #b9c0d1; line-height: 1.5; margin: 8px 0 14px; }}
-      .promo-links a {{ display: flex; align-items: center; gap: 10px; padding: 12px; border-radius: 10px;
-        text-decoration: none; color: #fff; font-size: 13.5px; font-weight: 700; line-height: 1.3;
-        background: #1471ef; box-shadow: 0 4px 14px rgba(20,113,239,0.35); }}
-      .promo-links .ic {{ width: 34px; height: 34px; border-radius: 50%; background: rgba(255,255,255,0.18);
-        display: flex; align-items: center; justify-content: center; flex-shrink: 0; }}
-      .promo-links svg {{ width: 16px; height: 16px; fill: #fff; }}
-      .promo-links small {{ display: block; font-weight: 400; opacity: 0.85; font-size: 11.5px; margin-top: 1px; }}
+      .promo {{
+        margin: 0 14px 14px;
+        padding: 0;
+        border-radius: 16px;
+        overflow: hidden;
+        position: relative;
+        background: radial-gradient(120% 140% at 15% 0%, #3a1440 0%, #1a0f2e 35%, #0d1224 70%, #0b0f1e 100%);
+        border: 1px solid rgba(255, 183, 77, 0.35);
+        box-shadow: 0 8px 32px rgba(255, 90, 0, 0.18), inset 0 1px 0 rgba(255,255,255,0.06);
+      }}
+      .promo-top {{ padding: 16px 16px 12px; text-align: center; }}
+      .promo-flash {{
+        display: inline-flex; align-items: center; gap: 5px;
+        background: linear-gradient(135deg, #ff6d00, #ff2d55);
+        color: #fff; font-weight: 800; font-size: 10.5px; letter-spacing: 0.4px;
+        padding: 4px 10px; border-radius: 999px; margin-bottom: 10px;
+        box-shadow: 0 4px 14px rgba(255,45,85,0.35);
+      }}
+      .promo-title {{
+        font-size: 20px; font-weight: 900; line-height: 1.2; letter-spacing: -0.3px;
+        background: linear-gradient(135deg, #ffd580, #ff9900 55%, #ff5e3a);
+        -webkit-background-clip: text; background-clip: text; color: transparent;
+      }}
+      .promo-sub {{ font-size: 12.5px; color: #d6dae8; margin-top: 8px; line-height: 1.5; }}
+      .promo-sub b {{ color: #ffb74d; font-weight: 800; }}
+      .promo-body {{ padding: 4px 16px 16px; }}
+      .promo-pills {{
+        display: flex; gap: 8px; margin-bottom: 14px;
+      }}
+      .promo-pill {{
+        flex: 1; text-align: center; text-decoration: none;
+        font-size: 11px; font-weight: 800; padding: 9px 6px; border-radius: 999px;
+        color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }}
+      .promo-pill.loot {{ background: linear-gradient(135deg, #ff6d00, #ff9100); box-shadow: 0 4px 12px rgba(255,109,0,0.3); }}
+      .promo-pill.error {{ background: linear-gradient(135deg, #00c853, #00a844); box-shadow: 0 4px 12px rgba(0,200,83,0.3); }}
+      .promo-pill.hidden {{ background: linear-gradient(135deg, #7c4dff, #b388ff); box-shadow: 0 4px 12px rgba(124,77,255,0.3); }}
+      .promo-cta {{
+        display: flex; align-items: center; justify-content: space-between; gap: 10px;
+        padding: 14px 16px; border-radius: 14px; text-decoration: none; color: #fff;
+        background: linear-gradient(135deg, #0088cc 0%, #229ed9 100%);
+        box-shadow: 0 6px 20px rgba(0,136,204,0.4);
+        border: 1px solid rgba(255,255,255,0.15);
+        margin-bottom: 14px;
+      }}
+      .promo-cta:active {{ transform: scale(0.98); }}
+      .promo-cta .cta-left {{ display: flex; align-items: center; gap: 10px; min-width: 0; }}
+      .promo-cta .ic {{
+        width: 38px; height: 38px; border-radius: 50%;
+        background: rgba(255,255,255,0.2);
+        display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+      }}
+      .promo-cta svg {{ width: 18px; height: 18px; fill: #fff; }}
+      .promo-cta .cta-text {{ font-size: 14.5px; font-weight: 800; line-height: 1.3; }}
+      .promo-cta .cta-text small {{ display: block; font-weight: 500; opacity: 0.9; font-size: 11px; margin-top: 2px; }}
+      .promo-cta .arrow {{
+        width: 26px; height: 26px; border-radius: 50%; background: rgba(255,255,255,0.18);
+        display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+      }}
+      .promo-cta .arrow svg {{ width: 13px; height: 13px; stroke: #fff; fill: none; stroke-width: 2.5; }}
+      .promo-social {{ display: flex; align-items: center; justify-content: center; gap: 10px; }}
+      .promo-social .avatars {{ display: flex; }}
+      .promo-social .avatars span {{
+        width: 26px; height: 26px; border-radius: 50%; display: flex; align-items: center;
+        justify-content: center; font-size: 13px; border: 2px solid #1a0f2e; margin-left: -8px;
+      }}
+      .promo-social .avatars span:first-child {{ margin-left: 0; }}
+      .promo-social .avatars span:nth-child(1) {{ background: #ffb74d; }}
+      .promo-social .avatars span:nth-child(2) {{ background: #7c4dff; }}
+      .promo-social .avatars span:nth-child(3) {{ background: #ff5e7d; }}
+      .promo-social .avatars span:nth-child(4) {{ background: #00c853; font-size: 9px; font-weight: 800; color: #fff; }}
+      .promo-social .count {{ font-size: 11.5px; font-weight: 700; color: #ffb74d; }}
       .footer {{ text-align: center; padding: 16px; font-size: 12px; color: #6ea8ff; }}
     </style>
     <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
@@ -3398,15 +3458,28 @@ async def player(token: str):
       </div>
 
       <div class="promo">
-        <div class="promo-head">
-          <span>✨</span><span class="p-title">Stay Updated. Never Miss a Deal 🛍️!</span>
+        <div class="promo-top">
+          <div class="promo-flash">⚡ LIMITED TIME</div>
+          <div class="promo-title">🔥 BIG DEALS LIVE NOW!</div>
+          <div class="promo-sub">Up to <b>90% OFF</b> on Amazon, Flipkart, Myntra &amp; Ajio</div>
         </div>
-        <p>Up to 90% off Deals from Amazon Flipkart Ajio Myntra. Must Join</p>
-        <div class="promo-links">
-          <a href="{loot_deals_url}" target="_blank">
-            <span class="ic"><svg viewBox="0 0 24 24"><path d="M21 3L3 10.5l6.5 2.5L12 21l3-6 6-12z"/></svg></span>
-            <span>Join Loot Deals<small>Best Deals &amp; Offers</small></span>
+        <div class="promo-body">
+          <div class="promo-pills">
+            <a class="promo-pill loot" href="{loot_deals_url}" target="_blank">🔥 Loot Deals</a>
+            <a class="promo-pill error" href="{loot_deals_url}" target="_blank">$ Error Price</a>
+            <a class="promo-pill hidden" href="{loot_deals_url}" target="_blank">🎁 Hidden Coupons</a>
+          </div>
+          <a class="promo-cta" href="{loot_deals_url}" target="_blank">
+            <span class="cta-left">
+              <span class="ic"><svg viewBox="0 0 24 24"><path d="M21 3L3 10.5l6.5 2.5L12 21l3-6 6-12z"/></svg></span>
+              <span class="cta-text">Join Deal Channel<small>Best Deals &amp; Offers Daily</small></span>
+            </span>
+            <span class="arrow"><svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
           </a>
+          <div class="promo-social">
+            <div class="avatars"><span>🧑</span><span>👩</span><span>🧔</span><span>99+</span></div>
+            <div class="count">120K+ Smart Shoppers</div>
+          </div>
         </div>
       </div>
 
