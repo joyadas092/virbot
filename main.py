@@ -179,7 +179,7 @@ _file_transfer_jobs: dict[str, dict] = {}
 # In-memory admin toggles (not persisted; reset on restart)
 QUOTA_ENABLED = True  # /shortlink_on|off - when False, free users must buy premium after free quota
 FREE_MODE_ENABLED = False  # /freemode_on|off - when True, bot is free for everyone
-SENDFILE_ENABLED = True  # /sendfile_on|off - when False, Get File (Premium) shows admin-disabled popup
+SENDFILE_ENABLED = False  # /sendfile_on|off - when False, Get File (Premium) shows admin-disabled popup
 
 # In-memory per-API usage/health counters (not persisted; reset on restart).
 # api_key -> {attempts, success, fail, consecutive_fails, last_ok_at, last_fail_at, last_error}
@@ -510,7 +510,6 @@ def _format_ago(ts: float | None) -> str:
 
 def _api_status_text() -> str:
     labels = [
-        ("api1", "API1 (vercel, free)"),
         ("api2", "API2 (hostinger, free)"),
         ("xverse", "API3 (xverse, paid fallback)"),
     ]
@@ -1723,40 +1722,6 @@ def _extract_terabox_hash(url: str) -> str:
     return ""
 
 
-async def _call_api1(url: str) -> dict | None:
-    """Free API #1: terabox-api-sable.vercel.app"""
-    endpoint = f"https://terabox-api-sable.vercel.app/terabox_video_streamv3?url={quote_plus(url)}"
-    try:
-        timeout = aiohttp.ClientTimeout(total=20)
-        ssl_context = _ssl_context_with_certifi()
-        connector = aiohttp.TCPConnector(ssl=ssl_context) if ssl_context else aiohttp.TCPConnector()
-        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-            async with session.get(endpoint) as resp:
-                if resp.status != 200:
-                    _record_api_result("api1", False, f"HTTP {resp.status}")
-                    return None
-                data = await resp.json(content_type=None)
-    except Exception as e:
-        _record_api_result("api1", False, f"{type(e).__name__}: {e}")
-        return None
-
-    if not data or not data.get("success"):
-        _record_api_result("api1", False, (data or {}).get("message") or "success=false")
-        return None
-
-    _record_api_result("api1", True)
-    fast_streams = data.get("fast_streams") or {}
-    stream = fast_streams.get("480p") or data.get("stream_url") or ""
-    return {
-        "name": data.get("filename") or "file",
-        "size_mb": _parse_size_string_to_mb(data.get("size") or ""),
-        "link": data.get("download_url") or "",
-        "stream": stream,
-        "thumbnail": data.get("thumbnail") or "",
-        "source": "api1",
-    }
-
-
 async def _call_api2(url: str) -> dict | None:
     """Free API #2: hostingersite tera.php - only accepts 1024terabox.com links."""
     target_url = url
@@ -1827,16 +1792,9 @@ def _normalize_xverse(data: dict | None) -> dict | None:
 
 async def fetch_terabox_link(url: str) -> tuple[dict | None, str]:
     """
-    Tries free API #1, then free API #2, then falls back to the paid xverse API.
+    Tries free API #2, then falls back to the paid xverse API.
     Returns (normalized_data, "") on success, or (None, error_message) on failure.
     """
-    try:
-        r1 = await _call_api1(url)
-        if r1:
-            return r1, ""
-    except Exception:
-        pass
-
     try:
         r2 = await _call_api2(url)
         if r2:
