@@ -119,7 +119,7 @@ RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "").strip()
 RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "").strip()
 
 PREMIUM_PLANS = {
-    # "day": {"label": "1 Day", "amount_inr": 3, "days": 1, "stars": 6},
+    "day": {"label": "1 Day", "amount_inr": 3, "days": 1, "stars": 6},
     "week": {"label": "1 Week", "amount_inr": 20, "days": 7, "stars": 40},
     "month": {"label": "1 Month", "amount_inr": 65, "days": 30, "stars": 130},
     "quarter": {"label": "3 Months", "amount_inr": 150, "days": 90, "stars": 300},
@@ -3548,23 +3548,44 @@ async def player(token: str):
     return Response(page, mimetype="text/html")
 
 
+_HLS_FORWARD_RESPONSE_HEADERS = ("Content-Range", "Accept-Ranges")
+
+
 @bot.get("/hls")
 async def hls_proxy():
     """
     Proxy + rewrite m3u8/segments to same-origin URLs to avoid WebView CORS issues.
+
+    Manifests are small and get fully buffered (needed to rewrite segment URLs).
+    Everything else (.ts/.aac/.mp4 chunks) is streamed straight through without
+    buffering the whole body in memory, and incoming Range requests are forwarded
+    upstream so video seeking doesn't force a full-file re-download/re-serve.
     """
     u = request.args.get("u", "")
     if not u:
         return Response("Missing url", status=400)
 
     upstream = unquote_plus(u)
-    async with aiohttp.ClientSession() as session:
-        async with session.get(upstream) as resp:
-            content_type = resp.headers.get("content-type", "")
-            body = await resp.read()
+    range_header = request.headers.get("Range")
 
-    # If it's an m3u8, rewrite segment URLs to route back through this proxy.
-    if "application/vnd.apple.mpegurl" in content_type or upstream.endswith(".m3u8"):
+    session = aiohttp.ClientSession()
+    try:
+        resp_cm = session.get(upstream, headers={"Range": range_header} if range_header else None)
+        resp = await resp_cm.__aenter__()
+    except Exception:
+        await session.close()
+        return Response("Upstream fetch failed", status=502)
+
+    content_type = resp.headers.get("content-type", "")
+    is_manifest = "application/vnd.apple.mpegurl" in content_type or upstream.endswith(".m3u8")
+
+    if is_manifest:
+        try:
+            body = await resp.read()
+        finally:
+            await resp_cm.__aexit__(None, None, None)
+            await session.close()
+
         try:
             text = body.decode("utf-8", errors="ignore")
         except Exception:
@@ -3580,8 +3601,21 @@ async def hls_proxy():
 
         return Response("\n".join(out_lines) + "\n", content_type="application/vnd.apple.mpegurl")
 
-    # For .ts/.aac/.mp4 chunks etc, stream bytes as-is.
-    return Response(body, content_type=content_type or "application/octet-stream")
+    status = resp.status
+    out_headers = {
+        name: resp.headers[name] for name in _HLS_FORWARD_RESPONSE_HEADERS if name in resp.headers
+    }
+
+    async def body_stream():
+        try:
+            async for chunk in resp.content.iter_chunked(64 * 1024):
+                yield chunk
+        finally:
+            await resp_cm.__aexit__(None, None, None)
+            await session.close()
+
+    return Response(body_stream(), status=status, headers=out_headers,
+                     content_type=content_type or "application/octet-stream")
 
 
 @bot.get("/health")
