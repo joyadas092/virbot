@@ -3235,7 +3235,10 @@ async def player(token: str):
     if not data or data.get("expires_at", 0) <= _now_ts():
         return Response("Stream link expired. Go back to the bot and generate again.", status=410)
 
-    # We route the playback through our proxy to avoid CORS issues in Telegram WebView.
+    # Try the upstream CDN directly first (0 Render bandwidth). Only fall back to
+    # our /hls proxy client-side if direct playback actually fails (e.g. no CORS
+    # headers from that source) — see fallback logic in the player script below.
+    direct_src = data['url']
     proxied_m3u8 = f"/hls?u={quote_plus(data['url'])}"
 
     file_name = html.escape(data.get("name") or "video.mp4")
@@ -3445,16 +3448,40 @@ async def player(token: str):
     </div>
     <script>
       const video = document.getElementById('v');
-      const src = {proxied_m3u8!r};
-      if (video.canPlayType('application/vnd.apple.mpegurl')) {{
-        video.src = src;
-      }} else if (window.Hls && Hls.isSupported()) {{
-        const hls = new Hls({{ enableWorker: true, lowLatencyMode: true }});
-        hls.loadSource(src);
-        hls.attachMedia(video);
-      }} else {{
-        document.querySelector('.hint div').textContent = 'HLS not supported in this webview.';
+      const directSrc = {direct_src!r};
+      const proxiedSrc = {proxied_m3u8!r};
+      let usingProxy = false;
+      let currentHls = null;
+
+      function loadSrc(url, isProxy) {{
+        usingProxy = isProxy;
+        if (currentHls) {{
+          currentHls.destroy();
+          currentHls = null;
+        }}
+        if (video.canPlayType('application/vnd.apple.mpegurl')) {{
+          video.src = url;
+        }} else if (window.Hls && Hls.isSupported()) {{
+          const hls = new Hls({{ enableWorker: true, lowLatencyMode: true }});
+          currentHls = hls;
+          hls.loadSource(url);
+          hls.attachMedia(video);
+          hls.on(Hls.Events.ERROR, (_evt, data) => {{
+            if (data.fatal && !usingProxy) {{
+              loadSrc(proxiedSrc, true);
+            }}
+          }});
+        }} else {{
+          document.querySelector('.hint div').textContent = 'HLS not supported in this webview.';
+        }}
       }}
+
+      // Direct-from-CDN first (saves bandwidth); silently fall back to the
+      // proxy on real playback failure (e.g. source has no CORS headers).
+      video.addEventListener('error', () => {{
+        if (!usingProxy) loadSrc(proxiedSrc, true);
+      }});
+      loadSrc(directSrc, false);
 
       function fmt(t) {{
         if (!isFinite(t) || t < 0) t = 0;
