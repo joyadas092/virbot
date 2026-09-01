@@ -660,11 +660,75 @@ def _api_status_text() -> str:
     return "\n".join(lines)
 
 
+async def _referral_stats_text(bot_key: str) -> str:
+    """Total confirmed referrals + top referrer (name + count).
+
+    Returns "" when referrals are not enabled (no DB or no referrals yet).
+    """
+    if referrals_col is None:
+        return ""
+    try:
+        total = int(await referrals_col.count_documents({"confirmed": True}))
+    except Exception:
+        return ""
+
+    top_line = "Top referrer: —"
+    try:
+        pipeline = [
+            {"$match": {"confirmed": True}},
+            {"$group": {"_id": "$referrer_id", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}},
+            {"$limit": 1},
+        ]
+        top = None
+        async for doc in referrals_col.aggregate(pipeline):
+            top = doc
+            break
+        if top and int(top.get("count", 0)) > 0:
+            rid = int(top["_id"])
+            count = int(top["count"])
+            name = await _get_user_display_name_local(rid)
+            top_line = f"Top referrer: {name} ({count})"
+    except Exception:
+        pass
+
+    return (
+        "🤝 Referrals\n"
+        f"Total confirmed: {total}\n"
+        f"{top_line}"
+    )
+
+
+async def _get_user_display_name_local(user_id: int) -> str:
+    """Username/first-name lookup that works without a pyrogram Client.
+
+    Reads from the cached users_col profile; falls back to 'user <id>'.
+    """
+    if users_col is not None:
+        try:
+            doc = await users_col.find_one(
+                {"user_id": int(user_id)},
+                {"username": 1, "first_name": 1, "last_name": 1},
+            )
+            if doc:
+                if doc.get("username"):
+                    return f"@{doc['username']}"
+                first = (doc.get("first_name") or "").strip()
+                last = (doc.get("last_name") or "").strip()
+                full = (f"{first} {last}").strip()
+                if full:
+                    return full
+        except Exception:
+            pass
+    return f"user {user_id}"
+
+
 async def _status_text(bot_key: str) -> str:
     api_text = _api_status_text()
+    referral_text = await _referral_stats_text(bot_key)
     if users_col is None:
         total_users = len(user_data)
-        return (
+        body = (
             "📊 Bot Status\n\n"
             f"Total users: {total_users}\n"
             "Premium users: DB not enabled\n"
@@ -673,21 +737,25 @@ async def _status_text(bot_key: str) -> str:
             f"sendfile={'on' if SENDFILE_ENABLED else 'off'}\n\n"
             f"{api_text}"
         )
-    now = _utc_now()
-    total_users = await users_col.count_documents({"bot_keys": bot_key})
-    premium_users = await users_col.count_documents({"bot_keys": bot_key, "premium_until": {"$gt": now}})
-    expired_premium_users = await users_col.count_documents({"bot_keys": bot_key, "premium_until": {"$lte": now}})
-    active_today = await users_col.count_documents({f"bots.{bot_key}.last_seen_at": {"$gte": now - timedelta(days=1)}})
-    return (
-        "📊 Bot Status\n\n"
-        f"Total users: {total_users}\n"
-        f"Premium active users: {premium_users}\n"
-        f"Premium expired users: {expired_premium_users}\n"
-        f"Active users (last 24h): {active_today}\n\n"
-        f"Toggles: freemode={'on' if FREE_MODE_ENABLED else 'off'} | "
-        f"sendfile={'on' if SENDFILE_ENABLED else 'off'}\n\n"
-        f"{api_text}"
-    )
+    else:
+        now = _utc_now()
+        total_users = await users_col.count_documents({"bot_keys": bot_key})
+        premium_users = await users_col.count_documents({"bot_keys": bot_key, "premium_until": {"$gt": now}})
+        expired_premium_users = await users_col.count_documents({"bot_keys": bot_key, "premium_until": {"$lte": now}})
+        active_today = await users_col.count_documents({f"bots.{bot_key}.last_seen_at": {"$gte": now - timedelta(days=1)}})
+        body = (
+            "📊 Bot Status\n\n"
+            f"Total users: {total_users}\n"
+            f"Premium active users: {premium_users}\n"
+            f"Premium expired users: {expired_premium_users}\n"
+            f"Active users (last 24h): {active_today}\n\n"
+            f"Toggles: freemode={'on' if FREE_MODE_ENABLED else 'off'} | "
+            f"sendfile={'on' if SENDFILE_ENABLED else 'off'}\n\n"
+            f"{api_text}"
+        )
+    if referral_text:
+        body += f"\n\n{referral_text}"
+    return body
 
 
 async def _razorpay_auth_header() -> dict:
@@ -2599,7 +2667,34 @@ async def status_cmd(client, message):
     await _upsert_user_profile(message.from_user, client.bot_key)
     if int(user_id) not in ADMIN_USER_IDS:
         return await message.reply("❌ You are not allowed to use this command.")
-    await message.reply(await _status_text(client.bot_key))
+    await message.reply(
+        await _status_text(client.bot_key),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Refresh", callback_data="status_refresh")],
+        ]),
+    )
+
+
+@app.on_callback_query(filters.regex("^status_refresh$"))
+async def status_refresh_cb(client, callback_query):
+    if int(callback_query.from_user.id) not in ADMIN_USER_IDS:
+        return await callback_query.answer("❌ Not allowed.", show_alert=True)
+    try:
+        await callback_query.answer("Refreshing…")
+    except Exception:
+        pass
+    bot_key = getattr(client, "bot_key", None) or _current_bot_username(client)
+    try:
+        await callback_query.message.edit_text(
+            await _status_text(bot_key),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Refresh", callback_data="status_refresh")],
+            ]),
+        )
+    except MessageNotModified:
+        pass
+    except Exception as e:
+        await report_error(client, "status_refresh", e)
 
 
 @app.on_message(filters.command("freemode_on"))
