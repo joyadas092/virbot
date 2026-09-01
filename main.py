@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import base64
 import hashlib
 import hmac
@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import quote_plus, unquote_plus, urljoin, urlparse
 
 from pyrogram import Client, filters, raw, utils
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo, LinkPreviewOptions
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 from pyrogram.errors import (
     UserNotParticipant,
     ChatAdminRequired,
@@ -2532,7 +2532,7 @@ async def refer_cmd(client, message):
         f"  • Confirmed referrals: <b>{count}</b>\n"
         f"  • Bonus credit banked: <b>{bonus}</b>",
         parse_mode=ParseMode.HTML,
-        link_preview_options=LinkPreviewOptions(is_disabled=True),
+        disable_web_page_preview=True,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("ðŸ”— Share Link", url=share_url)],
         ]),

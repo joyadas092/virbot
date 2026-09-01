@@ -9,6 +9,7 @@ import random
 import re
 import string
 import time
+import ssl
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote_plus, unquote_plus, urljoin, urlparse
@@ -24,6 +25,7 @@ from pyrogram.errors import (
     InputUserDeactivated,
     PeerIdInvalid,
     MessageNotModified,
+    WebpageMediaEmpty,
 )
 from pyrogram.enums import ChatMemberStatus
 import aiohttp
@@ -33,6 +35,11 @@ from quart import Quart
 from quart import Response, request
 
 try:
+    import certifi
+except Exception:
+    certifi = None
+
+try:
     from motor.motor_asyncio import AsyncIOMotorClient
 except Exception:
     AsyncIOMotorClient = None
@@ -40,7 +47,8 @@ except Exception:
 load_dotenv()
 BOT_BOOT_TIME_UTC = datetime.now(timezone.utc)
 
-MAX_SIZE = 15 * 1024 * 1024  # 15MB
+# Telegram allows bots to upload up to 2 GB; override via TELEGRAM_MAX_UPLOAD_MB if needed.
+TELEGRAM_MAX_UPLOAD_MB = float(os.getenv("TELEGRAM_MAX_UPLOAD_MB", "2048"))
 LIMIT_FREE_REQUESTS = 3
 UNLOCK_TOKEN_TTL_SECONDS = 60 * 60  # 1 hour to use the unlock token
 STREAM_TOKEN_TTL_SECONDS = 15 * 60  # 15 minutes
@@ -75,7 +83,18 @@ SUPPORTED_TERABOX_DOMAINS = (
     "nephobox.com",
     "momerybox.com",
 )
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "641770277"))
+def _parse_admin_ids() -> set[int]:
+    ids: set[int] = set()
+    for env_name in ("ADMIN_USER_IDS", "ADMIN_USER_ID"):
+        for part in os.getenv(env_name, "").split(","):
+            part = part.strip()
+            if part.lstrip("-").isdigit():
+                ids.add(int(part))
+    return ids or {641770277}
+
+
+ADMIN_USER_IDS = _parse_admin_ids()
+ADMIN_USER_ID = min(ADMIN_USER_IDS)  # primary admin, kept for legacy single-admin call sites
 ADMIN_CONTACT_BOT = os.getenv("ADMIN_CONTACT_BOT", "iMovies_contact_bot").lstrip("@")
 AUTO_DELETE_SECONDS = 45 * 60  # 45 minutes
 PREMIUM_DAILY_DOWNLOADS = int(os.getenv("PREMIUM_DAILY_DOWNLOADS", "50"))
@@ -92,7 +111,23 @@ SHORTLINK_API = os.getenv('SHORTLINK_API')
 BOT_USERNAME = os.getenv('BOT_USERNAME')
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 PUBLIC_BASE_URL = PUBLIC_BASE_URL.strip().strip('"').strip("'").rstrip("/")  # e.g. https://your-domain.com
-FORCE_SUB_CHANNEL = os.getenv("FORCE_SUB_CHANNEL", "")  # your updates channel
+FORCE_SUB_CHANNEL = os.getenv("FORCE_SUB_CHANNEL", "")  # your updates channel(s), comma separated
+
+
+def _split_env_list(raw: str) -> list[str]:
+    """Parse a comma (or newline) separated env value into a clean list."""
+    return [part.strip() for part in (raw or "").replace("\n", ",").split(",") if part.strip()]
+
+
+# Force-sub accepts any number of channels. FORCE_SUB_INVITE_URL is matched by
+# position, so the Nth invite link belongs to the Nth channel; entries left out
+# fall back to a link derived from the channel itself.
+FORCE_SUB_CHANNELS = _split_env_list(FORCE_SUB_CHANNEL)
+FORCE_SUB_INVITE_URLS = _split_env_list(os.getenv("FORCE_SUB_INVITE_URL", ""))
+# How long a pending join request counts as verified. 0 = until the bot
+# restarts. Telegram sends no update when a request is cancelled or declined,
+# so a TTL is the only way to expire access short of a restart.
+FORCE_SUB_REQUEST_TTL_SECONDS = int(float(os.getenv("FORCE_SUB_REQUEST_TTL_HOURS", "0")) * 3600)
 MONGO_URI = os.getenv("MONGO_URI", "").strip()
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "teradl").strip()
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "").strip()
@@ -100,13 +135,13 @@ RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "").strip()
 RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "").strip()
 
 PREMIUM_PLANS = {
-    # "day": {"label": "1 Day", "amount_inr": 5, "days": 1, "stars": 10},
-    "week": {"label": "1 Week", "amount_inr": 25, "days": 7, "stars": 50},
-    "month": {"label": "1 Month", "amount_inr": 70, "days": 30, "stars": 140},
+    "day": {"label": "1 Day", "amount_inr": 3, "days": 1, "stars": 6},
+    "week": {"label": "1 Week", "amount_inr": 20, "days": 7, "stars": 40},
+    "month": {"label": "1 Month", "amount_inr": 65, "days": 30, "stars": 130},
     "quarter": {"label": "3 Months", "amount_inr": 150, "days": 90, "stars": 300},
     "quota50": {
         "label": "Quota Top-up (+50 today)",
-        "amount_inr": 5,
+        "amount_inr": 3,
         "days": 0,
         "stars": 10,
         "quota_add": 50,
@@ -123,6 +158,11 @@ app = Client(
 
 bot = Quart(__name__)
 # bot.config['PROVIDE_AUTOMATIC_OPTIONS'] = True
+
+
+def _sanitize_bot_key(raw: str, fallback_idx: int = 0) -> str:
+    cleaned = re.sub(r"[^a-z0-9_]", "_", (raw or "").lower())
+    return cleaned or f"bot_{fallback_idx}"
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 # bot_info =  app.get_me()
@@ -137,7 +177,14 @@ user_locks: dict[int, asyncio.Lock] = {}
 tokens: dict[str, dict] = {}
 # stream_token -> {"url": str, "expires_at": float}
 stream_tokens: dict[str, dict] = {}
+# file_token -> pending Get File request metadata
+file_tokens: dict[str, dict] = {}
 payment_tokens: dict[str, dict] = {}
+# user_id -> {chat_id: requested_at_ts} for pending force-sub join requests.
+# Telegram lets bots see a join request only as a live update, never as a
+# query, so this is the sole record that a user asked to join. Not persisted:
+# a restart clears it and still-pending users must cancel and request again.
+_join_requests: dict[int, dict[int, float]] = {}
 
 mongo_client = None
 mongo_db = None
@@ -147,6 +194,51 @@ premium_reminder_task = None
 _force_sub_warned = False
 # broadcast job_id -> {"cancel": asyncio.Event, "admin_id": int}
 _broadcast_jobs: dict[str, dict] = {}
+# transfer job_id -> {"cancel": asyncio.Event, "user_id": int}
+_file_transfer_jobs: dict[str, dict] = {}
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Read a boolean env var, falling back to `default` when unset/blank."""
+    raw = (os.getenv(name, "") or "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on", "enabled")
+
+
+# Admin toggles. Changed at runtime by the /shortlink_*, /freemode_* and
+# /sendfile_* commands, but those changes are in-memory only and are lost on
+# every restart or deploy, so the startup state comes from these env vars.
+QUOTA_ENABLED = _env_flag("QUOTA_ENABLED", False)  # /shortlink_on|off - when False, free users must buy premium after free quota
+FREE_MODE_ENABLED = _env_flag("FREE_MODE_ENABLED", False)  # /freemode_on|off - when True, bot is free for everyone
+SENDFILE_ENABLED = _env_flag("SENDFILE_ENABLED", False)  # /sendfile_on|off - when False, Get File (Premium) shows admin-disabled popup
+
+# In-memory per-API usage/health counters (not persisted; reset on restart).
+# api_key -> {attempts, success, fail, consecutive_fails, last_ok_at, last_fail_at, last_error}
+_api_stats: dict[str, dict] = {}
+
+
+def _record_api_result(api_key: str, ok: bool, error: str = "") -> None:
+    st = _api_stats.setdefault(api_key, {
+        "attempts": 0, "success": 0, "fail": 0, "consecutive_fails": 0,
+        "last_ok_at": None, "last_fail_at": None, "last_error": "",
+    })
+    st["attempts"] += 1
+    if ok:
+        st["success"] += 1
+        st["consecutive_fails"] = 0
+        st["last_ok_at"] = _now_ts()
+    else:
+        st["fail"] += 1
+        st["consecutive_fails"] += 1
+        st["last_fail_at"] = _now_ts()
+        if error:
+            st["last_error"] = str(error)[:200]
+
+
+def _ssl_context_with_certifi() -> ssl.SSLContext | None:
+    if certifi is None:
+        return None
+    return ssl.create_default_context(cafile=certifi.where())
 
 
 def _today_utc_str() -> str:
@@ -165,6 +257,15 @@ def _cleanup_expired_tokens() -> None:
         stream_tokens.pop(t, None)
     for t in [k for k, v in payment_tokens.items() if v.get("expires_at", 0) <= now]:
         payment_tokens.pop(t, None)
+    for t in [k for k, v in file_tokens.items() if v.get("expires_at", 0) <= now]:
+        file_tokens.pop(t, None)
+    if FORCE_SUB_REQUEST_TTL_SECONDS > 0:
+        for uid in list(_join_requests):
+            chats = _join_requests[uid]
+            for cid in [c for c, ts in chats.items() if (now - ts) > FORCE_SUB_REQUEST_TTL_SECONDS]:
+                chats.pop(cid, None)
+            if not chats:
+                _join_requests.pop(uid, None)
 
 
 def _utc_now() -> datetime:
@@ -193,12 +294,23 @@ async def _get_premium_until(user_id: int) -> datetime | None:
     return None
 
 
+def _is_admin_user(user_id: int) -> bool:
+    return int(user_id) in ADMIN_USER_IDS
+
+
 async def _is_premium_user(user_id: int) -> bool:
     premium_until = await _get_premium_until(user_id)
     return bool(premium_until and premium_until > _utc_now())
 
 
-async def _upsert_user_profile(user) -> None:
+async def _has_premium_access(user_id: int) -> bool:
+    """Premium subscribers and env-configured admins get premium-only features."""
+    if _is_admin_user(user_id):
+        return True
+    return await _is_premium_user(user_id)
+
+
+async def _upsert_user_profile(user, bot_key: str) -> None:
     if users_col is None or not user:
         return
     now = _utc_now()
@@ -213,10 +325,13 @@ async def _upsert_user_profile(user) -> None:
                 "is_bot": bool(getattr(user, "is_bot", False)),
                 "updated_at": now,
                 "last_seen_at": now,
+                f"bots.{bot_key}.last_seen_at": now,
+                f"bots.{bot_key}.bot_username": bot_key,
             },
             "$setOnInsert": {
                 "created_at": now,
             },
+            "$addToSet": {"bot_keys": bot_key},
         },
         upsert=True,
     )
@@ -323,8 +438,8 @@ def _format_user_name(user_obj=None, fallback: str = "") -> str:
     return fallback or "Unknown"
 
 
-def _force_sub_join_url() -> str:
-    raw = (FORCE_SUB_CHANNEL or "").strip()
+def _force_sub_join_url_for(raw: str) -> str:
+    raw = (raw or "").strip()
     if not raw:
         return ""
     if raw.startswith(("http://", "https://")):
@@ -336,8 +451,8 @@ def _force_sub_join_url() -> str:
     return f"https://t.me/{raw}"
 
 
-def _force_sub_chat_ref() -> str | int | None:
-    raw = (FORCE_SUB_CHANNEL or "").strip()
+def _force_sub_chat_ref_for(raw: str) -> str | int | None:
+    raw = (raw or "").strip()
     if not raw:
         return None
     if raw.startswith("-100") and raw[1:].isdigit():
@@ -357,13 +472,27 @@ def _force_sub_chat_ref() -> str | int | None:
     return f"@{raw}"
 
 
+def _force_sub_targets() -> list[dict]:
+    """One entry per configured channel: the chat ref used for the membership
+    check, plus the invite URL its button should point at."""
+    targets: list[dict] = []
+    for idx, raw in enumerate(FORCE_SUB_CHANNELS):
+        invite = FORCE_SUB_INVITE_URLS[idx] if idx < len(FORCE_SUB_INVITE_URLS) else ""
+        targets.append({
+            "index": idx,
+            "raw": raw,
+            "ref": _force_sub_chat_ref_for(raw),
+            "url": invite or _force_sub_join_url_for(raw),
+        })
+    return targets
+
+
 async def _notify_admin(client: Client, text: str) -> None:
-    if not ADMIN_USER_ID:
-        return
-    try:
-        await client.send_message(ADMIN_USER_ID, text, disable_web_page_preview=True)
-    except Exception:
-        pass
+    for admin_id in ADMIN_USER_IDS:
+        try:
+            await client.send_message(admin_id, text, disable_web_page_preview=True)
+        except Exception:
+            pass
 
 
 async def _notify_premium_purchase(client: Client, user_id: int, plan_key: str, until: datetime, payment_id: str = "",
@@ -426,26 +555,66 @@ async def _notify_purchase(client: Client, user_id: int, plan_key: str, payment_
         await _notify_premium_purchase(client, user_id, plan_key, until, payment_id=payment_id, source=source)
 
 
-async def _status_text() -> str:
+def _format_ago(ts: float | None) -> str:
+    if not ts:
+        return "never"
+    return f"{_format_duration(_now_ts() - ts)} ago"
+
+
+def _api_status_text() -> str:
+    labels = [
+        ("api2", "API2 (hostinger, free)"),
+        ("xverse", "API3 (xverse, paid fallback)"),
+    ]
+    lines = ["🔌 API Health & Usage"]
+    for key, label in labels:
+        st = _api_stats.get(key)
+        if not st or st["attempts"] == 0:
+            lines.append(f"⚪ {label}: not used yet")
+            continue
+        cf = st["consecutive_fails"]
+        icon = "🟢" if cf == 0 else ("🟡" if cf < 3 else "🔴")
+        rate = (st["success"] / st["attempts"] * 100) if st["attempts"] else 0.0
+        line = (
+            f"{icon} {label}\n"
+            f"   Calls: {st['attempts']} | OK: {st['success']} | Fail: {st['fail']} ({rate:.0f}% success)\n"
+            f"   Last OK: {_format_ago(st['last_ok_at'])} | Last fail: {_format_ago(st['last_fail_at'])}"
+        )
+        if cf > 0 and st.get("last_error"):
+            line += f"\n   Last error: {st['last_error']}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+async def _status_text(bot_key: str) -> str:
+    api_text = _api_status_text()
     if users_col is None:
         total_users = len(user_data)
         return (
             "📊 Bot Status\n\n"
             f"Total users: {total_users}\n"
             "Premium users: DB not enabled\n"
-            f"In-memory users today: {total_users}"
+            f"In-memory users today: {total_users}\n\n"
+            f"Toggles: quota={'on' if QUOTA_ENABLED else 'off'} | "
+            f"freemode={'on' if FREE_MODE_ENABLED else 'off'} | "
+            f"sendfile={'on' if SENDFILE_ENABLED else 'off'}\n\n"
+            f"{api_text}"
         )
     now = _utc_now()
-    total_users = await users_col.count_documents({})
-    premium_users = await users_col.count_documents({"premium_until": {"$gt": now}})
-    expired_premium_users = await users_col.count_documents({"premium_until": {"$lte": now}})
-    active_today = await users_col.count_documents({"last_seen_at": {"$gte": now - timedelta(days=1)}})
+    total_users = await users_col.count_documents({"bot_keys": bot_key})
+    premium_users = await users_col.count_documents({"bot_keys": bot_key, "premium_until": {"$gt": now}})
+    expired_premium_users = await users_col.count_documents({"bot_keys": bot_key, "premium_until": {"$lte": now}})
+    active_today = await users_col.count_documents({f"bots.{bot_key}.last_seen_at": {"$gte": now - timedelta(days=1)}})
     return (
         "📊 Bot Status\n\n"
         f"Total users: {total_users}\n"
         f"Premium active users: {premium_users}\n"
         f"Premium expired users: {expired_premium_users}\n"
-        f"Active users (last 24h): {active_today}"
+        f"Active users (last 24h): {active_today}\n\n"
+        f"Toggles: quota={'on' if QUOTA_ENABLED else 'off'} | "
+        f"freemode={'on' if FREE_MODE_ENABLED else 'off'} | "
+        f"sendfile={'on' if SENDFILE_ENABLED else 'off'}\n\n"
+        f"{api_text}"
     )
 
 
@@ -857,62 +1026,209 @@ def _is_valid_https_url(u: str) -> bool:
         return False
 
 
-async def _is_subscribed(client: Client, user_id: int) -> bool:
+def _record_join_request(user_id: int, chat_id: int) -> None:
+    """Remember that a user asked to join a chat (no approval implied)."""
+    _join_requests.setdefault(int(user_id), {})[int(chat_id)] = _now_ts()
+
+
+def _has_join_request(user_id: int, chat_id: int) -> bool:
+    """Whether a still-valid join request is on record for this user + chat."""
+    ts = (_join_requests.get(int(user_id)) or {}).get(int(chat_id))
+    if ts is None:
+        return False
+    if FORCE_SUB_REQUEST_TTL_SECONDS <= 0:
+        return True
+    return (_now_ts() - ts) <= FORCE_SUB_REQUEST_TTL_SECONDS
+
+
+_force_sub_id_cache: dict[str, int] = {}
+
+
+async def _force_sub_chat_id(client: Client, target: dict) -> int | None:
+    """Numeric chat id for a target, so it can be matched against join requests.
+
+    Join-request updates always carry a numeric id, but FORCE_SUB_CHANNEL may
+    name the channel by @username, so resolve and cache the mapping.
     """
-    Returns True if user is a member/admin/owner of FORCE_SUB_CHANNEL.
-    Note: bot must be admin in the channel to read members reliably.
-    """
-    global _force_sub_warned
-    chat_ref = _force_sub_chat_ref()
+    ref = target.get("ref")
+    if ref is None:
+        return None
+    if isinstance(ref, int):
+        return ref
+    raw = target["raw"]
+    cached = _force_sub_id_cache.get(raw)
+    if cached is not None:
+        return cached
+    try:
+        chat = await client.get_chat(ref)
+        chat_id = int(getattr(chat, "id", 0) or 0)
+    except Exception:
+        return None
+    if chat_id:
+        _force_sub_id_cache[raw] = chat_id
+        return chat_id
+    return None
+
+
+async def _is_subscribed_to(client: Client, user_id: int, target: dict) -> bool:
+    """Membership check for one channel. Bot must be admin there to read members."""
+    chat_ref = target.get("ref")
     if chat_ref is None:
-        if FORCE_SUB_CHANNEL and not _force_sub_warned:
-            _force_sub_warned = True
-            await _notify_admin(
-                client,
-                (
-                    "⚠️ Force-sub check is disabled because `FORCE_SUB_CHANNEL` "
-                    "is an invite link. Set channel @username or numeric chat id "
-                    "for membership verification."
-                ),
-            )
+        # Invite-only link: membership cannot be verified, so don't block on it.
         return True
     try:
         m = await client.get_chat_member(chat_ref, user_id)
         # In channels, user may appear as RESTRICTED but still "joined".
         # Treat anything except LEFT/BANNED as subscribed.
-        return m.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
+        if m.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
+            return True
+        if m.status == ChatMemberStatus.BANNED:
+            # Banned users must never regain access through a stale join request.
+            return False
     except UserNotParticipant:
-        return False
+        pass
     except ChatAdminRequired:
         # If bot isn't admin, treat as not subscribed to force correct setup.
         return False
     except Exception:
         return False
 
+    # Not a member: a pending join request still counts as verified. Telegram
+    # gives bots no way to query pending requests, so this relies on having
+    # seen the live ChatJoinRequest update (see force_sub_join_request).
+    chat_id = await _force_sub_chat_id(client, target)
+    return bool(chat_id) and _has_join_request(user_id, chat_id)
 
-def _join_markup() -> InlineKeyboardMarkup:
-    join_url = os.getenv("FORCE_SUB_INVITE_URL", "") or _force_sub_join_url()
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Join Updates Channel", url=join_url)],
-        [InlineKeyboardButton("✅ Check Joined", callback_data="check_join")],
-    ])
+
+async def _missing_force_sub(client: Client, user_id: int) -> list[dict]:
+    """Channels this user still has to join. Empty list means access is allowed."""
+    global _force_sub_warned
+    targets = _force_sub_targets()
+    if not targets:
+        return []
+
+    unverifiable = [t for t in targets if t.get("ref") is None]
+    if unverifiable and not _force_sub_warned:
+        _force_sub_warned = True
+        names = ", ".join(t["raw"] for t in unverifiable)
+        await _notify_admin(
+            client,
+            (
+                "⚠️ Force-sub check is skipped for these entries because they are "
+                f"invite links: {names}\n\nSet a channel @username or numeric chat id "
+                "for membership verification."
+            ),
+        )
+
+    checks = await asyncio.gather(
+        *[_is_subscribed_to(client, user_id, t) for t in targets],
+        return_exceptions=True,
+    )
+    return [t for t, ok in zip(targets, checks) if ok is not True]
+
+
+async def _is_subscribed(client: Client, user_id: int) -> bool:
+    """True only when the user has joined every configured channel."""
+    return not await _missing_force_sub(client, user_id)
+
+
+_force_sub_title_cache: dict[str, str] = {}
+
+
+async def _force_sub_label(client: Client, target: dict) -> str:
+    """Readable channel name for the button; falls back to @name / 'Channel N'."""
+    raw = target["raw"]
+    cached = _force_sub_title_cache.get(raw)
+    if cached:
+        return cached
+    title = ""
+    if target.get("ref") is not None:
+        try:
+            chat = await client.get_chat(target["ref"])
+            title = (getattr(chat, "title", "") or "").strip()
+        except Exception:
+            title = ""
+    if not title:
+        title = raw if raw.startswith("@") else f"Channel {target['index'] + 1}"
+    _force_sub_title_cache[raw] = title
+    return title
+
+
+_force_sub_url_cache: dict[str, str] = {}
+
+
+async def _force_sub_url(client: Client, target: dict) -> str:
+    """Button URL for a channel.
+
+    Falls back to asking Telegram for an invite link, so a channel configured by
+    numeric id with no matching FORCE_SUB_INVITE_URL entry still gets a button
+    instead of blocking the user with nothing to tap. Requires the bot to be
+    admin there with invite rights.
+    """
+    url = (target.get("url") or "").strip()
+    if _is_valid_http_url(url):
+        return url
+    raw = target["raw"]
+    cached = _force_sub_url_cache.get(raw)
+    if cached:
+        return cached
+    ref = target.get("ref")
+    if ref is None:
+        return ""
+    link = ""
+    try:
+        chat = await client.get_chat(ref)
+        link = (getattr(chat, "invite_link", "") or "").strip()
+        if not link and getattr(chat, "username", None):
+            link = f"https://t.me/{chat.username}"
+    except Exception:
+        link = ""
+    if not link:
+        try:
+            link = (await client.export_chat_invite_link(ref) or "").strip()
+        except Exception:
+            link = ""
+    if link:
+        _force_sub_url_cache[raw] = link
+    return link
+
+
+async def _join_markup(client: Client, targets: list[dict] | None = None) -> InlineKeyboardMarkup:
+    """One join button per channel, then the shared verify button."""
+    if targets is None:
+        targets = _force_sub_targets()
+    rows = []
+    for t in targets:
+        url = await _force_sub_url(client, t)
+        if not _is_valid_http_url(url):
+            continue
+        label = await _force_sub_label(client, t)
+        rows.append([InlineKeyboardButton(f"📢 Join {label}", url=url)])
+    rows.append([InlineKeyboardButton("✅ Check Joined", callback_data="check_join")])
+    return InlineKeyboardMarkup(rows)
 
 
 async def _ensure_joined(client: Client, message) -> bool:
     """
-    Ensures user joined FORCE_SUB_CHANNEL. If not, prompts and returns False.
+    Ensures the user joined every FORCE_SUB_CHANNEL entry. If not, prompts
+    with a button per pending channel and returns False.
     """
     try:
         user_id = message.from_user.id
     except Exception:
         return False
 
-    if await _is_subscribed(client, user_id):
+    missing = await _missing_force_sub(client, user_id)
+    if not missing:
         return True
 
+    if len(missing) == 1:
+        intro = "To use this bot, please join our updates channel."
+    else:
+        intro = f"To use this bot, please join all {len(missing)} channels below."
     await message.reply(
-        f"To use this bot, please join our updates channel.\n\nAfter joining, tap **Check Joined**.",
-        reply_markup=_join_markup()
+        f"{intro}\n\nAfter joining, tap **Check Joined**.",
+        reply_markup=await _join_markup(client, missing),
     )
     return False
 
@@ -947,10 +1263,103 @@ def _support_markup() -> InlineKeyboardMarkup:
 
 
 def _file_caption(name: str, size_mb: float) -> str:
+    size_line = f"📦 {size_mb} MB" if size_mb and size_mb > 0 else "📦 Size unknown"
     return (
         f"📁 {name}\n"
-        f"📦 {size_mb} MB\n\n"
+        f"{size_line}\n\n"
         f"⚠️ This file/message will be deleted automatically in 45 minutes (copyright)."
+    )
+
+
+def _file_options_caption(name: str, size_mb: float, *, has_stream: bool = False) -> str:
+    size_line = f"📦 {size_mb} MB" if size_mb and size_mb > 0 else "📦 Size unknown"
+    lines = [
+        f"📁 {name}",
+        size_line,
+        "",
+        "Choose an option:",
+    ]
+    if has_stream and PUBLIC_BASE_URL:
+        lines.append("▶️ Watch Now (Free) — stream in web app")
+    else:
+        lines.append("▶️ Watch Now (Free) — unavailable for this file")
+    lines.append("📥 Get File (Premium) — sent here (auto-deleted in 45 min)")
+    if size_mb > TELEGRAM_MAX_UPLOAD_MB:
+        lines.append(
+            f"\n⚠️ File exceeds Telegram upload limit ({TELEGRAM_MAX_UPLOAD_MB:.0f} MB). "
+            "Use Watch Now if Get File fails."
+        )
+    return "\n".join(lines)
+
+
+def _build_file_options_markup(
+    file_token: str,
+    *,
+    stream: str,
+    name: str,
+    size_mb: float,
+    download_url: str,
+) -> InlineKeyboardMarkup | None:
+    rows = []
+    if stream and PUBLIC_BASE_URL:
+        stoken = create_stream_token(
+            stream, name=name, size_mb=size_mb, download_url=download_url or "", quality="480p",
+        )
+        web_app_url = f"{PUBLIC_BASE_URL}/player/{stoken}"
+        if _is_valid_https_url(web_app_url):
+            rows.append([InlineKeyboardButton(
+                "▶️ Watch Now (Free)",
+                web_app=WebAppInfo(url=web_app_url),
+            )])
+    if _is_valid_http_url(download_url):
+        rows.append([InlineKeyboardButton(
+            "📥 Get File (Premium)",
+            callback_data=f"gfile:{file_token}",
+        )])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def _send_file_options_message(
+    client: Client,
+    message,
+    msg,
+    *,
+    caption: str,
+    markup: InlineKeyboardMarkup,
+    thumbnail: str,
+) -> None:
+    """Send file options; use thumbnail when valid, otherwise fall back to text-only."""
+    if thumbnail and _is_valid_http_url(thumbnail):
+        deleted_fetch_msg = False
+        try:
+            await msg.delete()
+            deleted_fetch_msg = True
+        except Exception:
+            pass
+        try:
+            info = await client.send_photo(
+                message.chat.id,
+                photo=thumbnail.strip(),
+                caption=caption,
+                reply_markup=markup,
+            )
+            _schedule_expire_media_message(client, info.chat.id, info.id)
+            return
+        except (WebpageMediaEmpty, Exception):
+            if deleted_fetch_msg:
+                msg = None
+
+    if msg is not None:
+        try:
+            await msg.edit(caption, reply_markup=markup)
+            _schedule_disable_and_mark_expired(client, msg.chat.id, msg.id, is_caption=False)
+            return
+        except Exception:
+            pass
+
+    info = await message.reply(caption, reply_markup=markup)
+    _schedule_disable_and_mark_expired(
+        client, info.chat.id, info.id, is_caption=bool(getattr(info, "caption", None)),
     )
 
 
@@ -1073,11 +1482,13 @@ async def _get_plan_text_and_markup(user_id: int) -> tuple[str, InlineKeyboardMa
     daily_limit = PREMIUM_DAILY_DOWNLOADS if is_premium else LIMIT_FREE_REQUESTS
     state = await _get_quota_state(user_id, daily_limit=daily_limit)
     remaining = int(state.get("remaining", 0))
+    freemode_note = "\n\n🎉 Free mode is activated by admin temporarily for all users. Enjoy!" if FREE_MODE_ENABLED else ""
     if is_premium:
         text = (
             "Your Account Details:\n"
             "Premium Member : ✅\n"
             f"todays limit : {remaining} Remaining"
+            f"{freemode_note}"
         )
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton("Contact Admin", url="https://t.me/imovies_contact_bot")]
@@ -1088,15 +1499,16 @@ async def _get_plan_text_and_markup(user_id: int) -> tuple[str, InlineKeyboardMa
         "Your Account Details:\n"
         "Premium Member : ❌\n"
         f"Free Downloads : Remaining {remaining}/{daily_limit} downloads"
+        f"{freemode_note}"
     )
     return text, None
 
 
-async def _iter_all_user_ids() -> list[int]:
+async def _iter_all_user_ids(bot_key: str) -> list[int]:
     if users_col is None:
         return [int(uid) for uid in user_data.keys()]
     ids: list[int] = []
-    cursor = users_col.find({}, {"user_id": 1, "_id": 0})
+    cursor = users_col.find({"bot_keys": bot_key}, {"user_id": 1, "_id": 0})
     async for doc in cursor:
         uid = doc.get("user_id")
         if isinstance(uid, int):
@@ -1104,12 +1516,18 @@ async def _iter_all_user_ids() -> list[int]:
     return ids
 
 
-async def _remove_user_record(user_id: int) -> None:
+async def _remove_user_record(user_id: int, bot_key: str) -> None:
     uid = int(user_id)
     user_data.pop(uid, None)
     user_locks.pop(uid, None)
     if users_col is not None:
-        await users_col.delete_one({"user_id": uid})
+        await users_col.update_one(
+            {"user_id": uid},
+            {"$unset": {f"bots.{bot_key}": ""}, "$pull": {"bot_keys": bot_key}},
+        )
+        doc = await users_col.find_one({"user_id": uid}, {"bot_keys": 1})
+        if doc is not None and not (doc.get("bot_keys") or []):
+            await users_col.delete_one({"user_id": uid})
 
 
 def _format_duration(seconds: float) -> str:
@@ -1158,6 +1576,27 @@ def _broadcast_progress_text(
     return "\n".join(lines)
 
 
+def _current_bot_username(client: Client | None = None) -> str:
+    me = getattr(client, "me", None) if client is not None else None
+    username = (getattr(me, "username", "") or "").strip()
+    if username:
+        return username.lstrip("@")
+
+    me = getattr(app, "me", None)
+    username = (getattr(me, "username", "") or "").strip()
+    if username:
+        return username.lstrip("@")
+
+    return (BOT_USERNAME or "").strip().lstrip("@")
+
+
+def _bot_start_url(client: Client | None, payload: str) -> str:
+    username = _current_bot_username(client)
+    if not username:
+        return ""
+    return f"https://t.me/{username}?start={quote_plus(str(payload))}"
+
+
 async def _broadcast_send_one(
     client: Client,
     *,
@@ -1165,6 +1604,7 @@ async def _broadcast_send_one(
     admin_chat_id: int,
     src_message_id: int | None,
     payload_text: str,
+    bot_key: str,
 ) -> str:
     """
     Returns: sent | blocked | removed | failed
@@ -1188,15 +1628,16 @@ async def _broadcast_send_one(
             admin_chat_id=admin_chat_id,
             src_message_id=src_message_id,
             payload_text=payload_text,
+            bot_key=bot_key,
         )
     except UserIsBlocked:
-        await _remove_user_record(target_id)
+        await _remove_user_record(target_id, bot_key)
         return "blocked"
     except InputUserDeactivated:
-        await _remove_user_record(target_id)
+        await _remove_user_record(target_id, bot_key)
         return "removed"
     except PeerIdInvalid:
-        await _remove_user_record(target_id)
+        await _remove_user_record(target_id, bot_key)
         return "removed"
     except Exception:
         return "failed"
@@ -1226,8 +1667,8 @@ async def send_unlock_once(client: Client, message, user_id: int) -> bool:
         user["last_unlock_prompt_ts"] = now
         user_data[user_id] = user
 
-    shortlink = await generate_shortlink(user_id)
-    premium_url = f"https://t.me/{BOT_USERNAME}?start=premium"
+    shortlink = await generate_shortlink(user_id, client=client)
+    premium_url = _bot_start_url(client, "premium")
     await message.reply(
         f"❌ Your Current Limit reached.\n\nWatch below ad to get next {LIMIT_FREE_REQUESTS} downloads:"
         f"Apple Users: Copy Ad Link, open in browser, and fully close Telegram."
@@ -1236,6 +1677,42 @@ async def send_unlock_once(client: Client, message, user_id: int) -> bool:
             [InlineKeyboardButton("🔓 Unlock Access| Watch Ad", url=shortlink)],
             [InlineKeyboardButton("❓ How to Unlock", url="https://t.me/howdisk/3")],
             [InlineKeyboardButton("💎 Buy Premium", url=premium_url)]
+        ])
+    )
+    return True
+
+
+async def send_premium_required_once(client: Client, message, user_id: int) -> bool:
+    """
+    Sends the premium prompt at most once per cooldown window per user.
+    Returns True if a prompt was sent, False if suppressed (already sent recently).
+    """
+    lock = _get_user_lock(user_id)
+    async with lock:
+        now = _now_ts()
+        user = user_data.get(user_id) or {}
+        last_ts = float(user.get("last_premium_prompt_ts") or 0)
+        if now - last_ts < UNLOCK_PROMPT_COOLDOWN_SECONDS:
+            return False
+        user["last_premium_prompt_ts"] = now
+        user_data[user_id] = user
+
+    premium_url = _bot_start_url(client, "premium")
+    await message.reply(
+        f"Your {LIMIT_FREE_REQUESTS} free downloads are over for today.\n\n"
+        "Ad unlock is currently disabled. Please buy premium membership to continue downloading.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Buy Premium", url=premium_url)],
+            [InlineKeyboardButton("Contact Admin", url=f"https://t.me/{ADMIN_CONTACT_BOT}")],
+        ])
+    )
+    return True
+    await message.reply(
+        f"âŒ Your {LIMIT_FREE_REQUESTS} free downloads are over for today.\n\n"
+        "Ad unlock is currently disabled. Please buy premium membership to continue downloading.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("ðŸ’Ž Buy Premium", url=premium_url)],
+            [InlineKeyboardButton("Contact Admin", url=f"https://t.me/{ADMIN_CONTACT_BOT}")],
         ])
     )
     return True
@@ -1286,16 +1763,15 @@ async def report_error(client: Client, where: str, err: Exception, extra: dict |
         extra_txt = ""
         if extra:
             extra_txt = "\n\nExtra:\n" + "\n".join([f"- {k}: {str(v)[:800]}" for k, v in extra.items()])
-        await client.send_message(
-            ADMIN_USER_ID,
+        await _notify_admin(
+            client,
             f"❗️Bot error in `{where}`{user_line}\n\n{type(err).__name__}: {err}{extra_txt}",
-            disable_web_page_preview=True,
         )
     except Exception:
         return
 
 
-async def generate_shortlink(user_id):
+async def generate_shortlink(user_id, client: Client | None = None):
     _cleanup_expired_tokens()
     token = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
 
@@ -1305,7 +1781,7 @@ async def generate_shortlink(user_id):
         "expires_at": _now_ts() + UNLOCK_TOKEN_TTL_SECONDS,
     }
 
-    destination = f"https://t.me/{BOT_USERNAME}?start={token}"
+    destination = _bot_start_url(client, token)
 
     url = f"https://nanolinks.in/api?api={SHORTLINK_API}&url={destination}"
 
@@ -1331,7 +1807,159 @@ def create_stream_token(stream_url: str, name: str = "", size_mb: float = 0.0,
     return token
 
 
+FILE_TOKEN_TTL_SECONDS = 30 * 60  # 30 minutes to choose Get File
+
+
+def create_file_token(
+    link: str,
+    name: str,
+    size_mb: float,
+    stream: str,
+    user_id: int,
+) -> str:
+    _cleanup_expired_tokens()
+    token = "".join(random.choices(string.ascii_letters + string.digits, k=16))
+    file_tokens[token] = {
+        "link": link,
+        "name": name,
+        "size_mb": size_mb,
+        "stream": stream,
+        "user_id": int(user_id),
+        "expires_at": _now_ts() + FILE_TOKEN_TTL_SECONDS,
+    }
+    return token
+
+
+def _transfer_progress_text(
+    *,
+    name: str,
+    size_mb: float,
+    phase: str,
+    current: int,
+    total: int,
+    speed_bps: float,
+    elapsed: float,
+    cancelled: bool = False,
+    finished: bool = False,
+    error: str = "",
+) -> str:
+    size_line = f"📦 {size_mb} MB" if size_mb and size_mb > 0 else "📦 Size unknown"
+    lines = [f"📁 {name}", size_line, ""]
+
+    if cancelled and finished:
+        lines.append("⏹ Transfer cancelled.")
+    elif error:
+        lines.append(f"❌ {error}")
+    elif finished:
+        lines.append("✅ File sent. It will be deleted in 45 minutes.")
+    else:
+        lines.append(f"⏳ {phase}...")
+        if total > 0:
+            pct = min(100.0, (current / total) * 100)
+            lines.append(f"Progress: {_human_size(current)} / {_human_size(total)} ({pct:.1f}%)")
+        elif current > 0:
+            lines.append(f"Transferred: {_human_size(current)}")
+        if speed_bps > 0:
+            lines.append(f"Speed: {_human_size(speed_bps)}/s")
+        if total > 0 and current > 0 and current < total and speed_bps > 0:
+            eta = (total - current) / speed_bps
+            lines.append(f"ETA: ~{_format_duration(eta)}")
+        lines.append(f"Elapsed: {_format_duration(elapsed)}")
+
+    return "\n".join(lines)
+
+
+class TransferCancelled(Exception):
+    pass
+
+
+async def download_file_with_progress(
+    url: str,
+    path: str,
+    *,
+    cancel_event: asyncio.Event,
+    total_bytes: int = 0,
+    on_progress=None,
+) -> None:
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=120)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url) as resp:
+            resp.raise_for_status()
+            if not total_bytes:
+                total_bytes = int(resp.headers.get("Content-Length", 0) or 0)
+            downloaded = 0
+            with open(path, "wb") as f:
+                async for chunk in resp.content.iter_chunked(1024 * 1024):
+                    if cancel_event.is_set():
+                        raise TransferCancelled()
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if on_progress:
+                        await on_progress(downloaded, total_bytes)
+
+
 # ===== API CALL =====
+def _parse_size_string_to_mb(size_str: str) -> float:
+    m = re.match(r'\s*([\d.]+)\s*([KMGT]?B)', size_str or "", re.I)
+    if not m:
+        return 0.0
+    val = float(m.group(1))
+    unit = m.group(2).upper()
+    mult = {"B": 1 / 1024 / 1024, "KB": 1 / 1024, "MB": 1, "GB": 1024, "TB": 1024 * 1024}.get(unit, 1)
+    return round(val * mult, 2)
+
+
+def _extract_terabox_hash(url: str) -> str:
+    u = (url or "").strip()
+    m = re.search(r'/s/([A-Za-z0-9_-]+)', u)
+    if m:
+        return m.group(1)
+    qs = urlparse(u).query
+    m2 = re.search(r'surl=([A-Za-z0-9_-]+)', qs)
+    if m2:
+        h = m2.group(1)
+        return h if h.startswith("1") else f"1{h}"
+    return ""
+
+
+async def _call_api2(url: str) -> dict | None:
+    """Free API #2: hostingersite tera.php - only accepts 1024terabox.com links."""
+    target_url = url
+    if "1024terabox.com" not in url.lower():
+        h = _extract_terabox_hash(url)
+        if not h:
+            _record_api_result("api2", False, "could not extract hash from url")
+            return None
+        target_url = f"https://1024terabox.com/s/{h}"
+
+    endpoint = f"https://gold-newt-367030.hostingersite.com/tera.php?url={quote_plus(target_url)}"
+    try:
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(endpoint) as resp:
+                if resp.status != 200:
+                    _record_api_result("api2", False, f"HTTP {resp.status}")
+                    return None
+                data = await resp.json(content_type=None)
+    except Exception as e:
+        _record_api_result("api2", False, f"{type(e).__name__}: {e}")
+        return None
+
+    if not data or not data.get("success"):
+        _record_api_result("api2", False, (data or {}).get("message") or "success=false")
+        return None
+
+    _record_api_result("api2", True)
+    return {
+        "name": data.get("title") or "file",
+        "size_mb": 0.0,
+        "link": "",
+        "stream": data.get("play_url") or "",
+        "thumbnail": data.get("thumbnail") or "",
+        "source": "api2",
+    }
+
+
 async def get_data(url):
     api_url = "https://xapiverse.com/api/terabox"
 
@@ -1347,13 +1975,160 @@ async def get_data(url):
             return await resp.json()
 
 
+def _normalize_xverse(data: dict | None) -> dict | None:
+    if not data or data.get("status") != "success":
+        return None
+    file = (data.get("list") or [{}])[0]
+    size = int(file.get("size", 0))
+    return {
+        "name": file.get("name", "file"),
+        "size_mb": round(size / 1024 / 1024, 2),
+        "link": file.get("normal_dlink") or "",
+        "stream": (file.get("fast_stream_url") or {}).get("480p") or file.get("normal_dlink") or "",
+        "thumbnail": file.get("thumbnail") or "",
+        "source": "xverse",
+    }
+
+
+async def fetch_terabox_link(url: str) -> tuple[dict | None, str]:
+    """
+    Tries free API #2, then falls back to the paid xverse API.
+    Returns (normalized_data, "") on success, or (None, error_message) on failure.
+    """
+    try:
+        r2 = await _call_api2(url)
+        if r2:
+            return r2, ""
+    except Exception:
+        pass
+
+    try:
+        xverse_data = await get_data(url)
+    except Exception as e:
+        _record_api_result("xverse", False, f"{type(e).__name__}: {e}")
+        return None, "Failed to fetch data."
+
+    norm = _normalize_xverse(xverse_data)
+    if norm:
+        _record_api_result("xverse", True)
+        return norm, ""
+
+    api_msg = (xverse_data or {}).get("message") or "Failed to fetch data."
+    _record_api_result("xverse", False, api_msg)
+    return None, api_msg
+
+
 # ===== DOWNLOAD =====
-async def download_file(url, path):
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            with open(path, "wb") as f:
-                async for chunk in resp.content.iter_chunked(1024 * 1024):
-                    f.write(chunk)
+async def _run_get_file_transfer(
+    client: Client,
+    *,
+    chat_id: int,
+    progress_msg_id: int,
+    job_id: str,
+    link: str,
+    name: str,
+    size_mb: float,
+) -> None:
+    cancel_event = _file_transfer_jobs[job_id]["cancel"]
+    cancel_markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏹ Cancel", callback_data=f"gfcancel:{job_id}")]
+    ])
+    started = time.monotonic()
+    last_edit = 0.0
+    last_bytes = 0
+    last_tick = started
+    current = 0
+    total = int(size_mb * 1024 * 1024) if size_mb > 0 else 0
+    phase = "Downloading"
+
+    async def _refresh(force: bool = False, **extra):
+        nonlocal last_edit, last_bytes, last_tick, current, total, phase
+        now = time.monotonic()
+        dt = max(now - last_tick, 0.001)
+        speed = max(0, current - last_bytes) / dt if not extra.get("finished") else 0
+        if not force and (now - last_edit) < 1.5 and not extra.get("finished"):
+            last_bytes = current
+            last_tick = now
+            return
+        text = _transfer_progress_text(
+            name=name,
+            size_mb=size_mb,
+            phase=phase,
+            current=current,
+            total=total,
+            speed_bps=speed,
+            elapsed=now - started,
+            **extra,
+        )
+        markup = None if extra.get("finished") or extra.get("cancelled") or extra.get("error") else cancel_markup
+        try:
+            await client.edit_message_text(chat_id, progress_msg_id, text, reply_markup=markup)
+        except MessageNotModified:
+            pass
+        except Exception:
+            pass
+        last_edit = now
+        last_bytes = current
+        last_tick = now
+
+    async def _on_download_progress(done: int, file_total: int):
+        nonlocal current, total
+        current = done
+        if file_total > 0:
+            total = file_total
+        await _refresh()
+
+    os.makedirs("downloads", exist_ok=True)
+    safe_name = re.sub(r'[<>:"/\\|?*]', "_", name) or "file.bin"
+    path = f"downloads/{job_id}_{safe_name}"
+
+    try:
+        await _refresh(force=True)
+        await download_file_with_progress(
+            link,
+            path,
+            cancel_event=cancel_event,
+            total_bytes=total,
+            on_progress=_on_download_progress,
+        )
+        if cancel_event.is_set():
+            raise TransferCancelled()
+
+        file_size = os.path.getsize(path)
+        phase = "Uploading"
+        current = 0
+        total = file_size
+        await _refresh(force=True)
+
+        async def _on_upload_progress(sent: int, file_total: int):
+            nonlocal current, total
+            if cancel_event.is_set():
+                raise TransferCancelled()
+            current = sent
+            if file_total > 0:
+                total = file_total
+            await _refresh()
+
+        sent = await client.send_document(
+            chat_id,
+            path,
+            caption=_file_caption(name, size_mb),
+            progress=_on_upload_progress,
+        )
+        _schedule_delete_message(client, sent.chat.id, sent.id)
+        await _refresh(force=True, finished=True)
+    except TransferCancelled:
+        await _refresh(force=True, cancelled=True, finished=True)
+    except Exception as e:
+        await _refresh(force=True, error="Transfer failed. Please try again.", finished=True)
+        await report_error(client, "get_file_transfer", e, extra={"user_id": _file_transfer_jobs.get(job_id, {}).get("user_id")})
+    finally:
+        _file_transfer_jobs.pop(job_id, None)
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
 
 
 async def send_premium_menu(message, user_id: int):
@@ -1417,7 +2192,7 @@ async def send_quota_topup_menu(message, user_id: int, daily_limit: int):
 @app.on_message(filters.command("start"))
 async def start(client, message):
     user_id = message.from_user.id
-    await _upsert_user_profile(message.from_user)
+    await _upsert_user_profile(message.from_user, client.bot_key)
     args = message.text.split(" ")
 
     text = message.caption if message.caption else message.text
@@ -1428,14 +2203,14 @@ async def start(client, message):
             pass
         return
 
-    if not await _ensure_joined(client, message):
-        return
-
     # 🔓 Unlock flow
     if len(args) > 1:
         token = args[1]
         if token == "premium":
             return await send_premium_menu(message, user_id)
+
+        if not QUOTA_ENABLED:
+            return await send_premium_required_once(client, message, user_id)
 
         data = tokens.get(token)
 
@@ -1469,7 +2244,7 @@ async def start(client, message):
 @app.on_message(filters.command("premium"))
 async def premium_cmd(client, message):
     user_id = message.from_user.id
-    await _upsert_user_profile(message.from_user)
+    await _upsert_user_profile(message.from_user, client.bot_key)
     if not await _ensure_joined(client, message):
         return
     await send_premium_menu(message, user_id)
@@ -1478,7 +2253,7 @@ async def premium_cmd(client, message):
 @app.on_message(filters.command("myplan"))
 async def myplan_cmd(client, message):
     user_id = message.from_user.id
-    await _upsert_user_profile(message.from_user)
+    await _upsert_user_profile(message.from_user, client.bot_key)
     if not await _ensure_joined(client, message):
         return
     text, markup = await _get_plan_text_and_markup(user_id)
@@ -1488,20 +2263,84 @@ async def myplan_cmd(client, message):
 @app.on_message(filters.command("status"))
 async def status_cmd(client, message):
     user_id = message.from_user.id
-    await _upsert_user_profile(message.from_user)
-    if int(user_id) != int(ADMIN_USER_ID):
+    await _upsert_user_profile(message.from_user, client.bot_key)
+    if int(user_id) not in ADMIN_USER_IDS:
         return await message.reply("❌ You are not allowed to use this command.")
-    await message.reply(await _status_text())
+    await message.reply(await _status_text(client.bot_key))
+
+
+@app.on_message(filters.command("shortlink_on"))
+async def shortlink_on_cmd(client, message):
+    global QUOTA_ENABLED
+    user_id = message.from_user.id
+    if int(user_id) not in ADMIN_USER_IDS:
+        return await message.reply("❌ You are not allowed to use this command.")
+    QUOTA_ENABLED = True
+    return await message.reply("OK. Shortlink unlock ENABLED. After free quota, users can watch an ad to get more downloads.")
+    await message.reply("✅ Quota mechanism ENABLED. Free users now go through the shortlink/ad-unlock flow.")
+
+
+@app.on_message(filters.command("shortlink_off"))
+async def shortlink_off_cmd(client, message):
+    global QUOTA_ENABLED
+    user_id = message.from_user.id
+    if int(user_id) not in ADMIN_USER_IDS:
+        return await message.reply("❌ You are not allowed to use this command.")
+    QUOTA_ENABLED = False
+    return await message.reply("OK. Shortlink unlock DISABLED. Free users still get 3 downloads, then must buy premium.")
+    await message.reply("✅ Quota mechanism DISABLED. All users get unlimited downloads (no credit checks).")
+
+
+@app.on_message(filters.command("freemode_on"))
+async def freemode_on_cmd(client, message):
+    global FREE_MODE_ENABLED
+    user_id = message.from_user.id
+    if int(user_id) not in ADMIN_USER_IDS:
+        return await message.reply("❌ You are not allowed to use this command.")
+    FREE_MODE_ENABLED = True
+    await message.reply("✅ Free mode ENABLED. Bot is free for all users until turned off.")
+
+
+@app.on_message(filters.command("freemode_off"))
+async def freemode_off_cmd(client, message):
+    global FREE_MODE_ENABLED
+    user_id = message.from_user.id
+    if int(user_id) not in ADMIN_USER_IDS:
+        return await message.reply("❌ You are not allowed to use this command.")
+    FREE_MODE_ENABLED = False
+    await message.reply("✅ Free mode DISABLED. Normal quota/premium rules apply again.")
+
+
+@app.on_message(filters.command("sendfile_on"))
+async def sendfile_on_cmd(client, message):
+    global SENDFILE_ENABLED
+    user_id = message.from_user.id
+    if int(user_id) not in ADMIN_USER_IDS:
+        return await message.reply("❌ You are not allowed to use this command.")
+    SENDFILE_ENABLED = True
+    await message.reply("✅ Get File (Premium) ENABLED. Premium users can download files again.")
+
+
+@app.on_message(filters.command("sendfile_off"))
+async def sendfile_off_cmd(client, message):
+    global SENDFILE_ENABLED
+    user_id = message.from_user.id
+    if int(user_id) not in ADMIN_USER_IDS:
+        return await message.reply("❌ You are not allowed to use this command.")
+    SENDFILE_ENABLED = False
+    await message.reply(
+        "✅ Get File (Premium) DISABLED. The button stays visible, but users see a temporary-closed popup."
+    )
 
 
 @app.on_message(filters.command("broadcast"))
 async def broadcast_cmd(client, message):
     user_id = message.from_user.id
-    await _upsert_user_profile(message.from_user)
-    if int(user_id) != int(ADMIN_USER_ID):
+    await _upsert_user_profile(message.from_user, client.bot_key)
+    if int(user_id) not in ADMIN_USER_IDS:
         return await message.reply("❌ You are not allowed to use this command.")
 
-    users = await _iter_all_user_ids()
+    users = await _iter_all_user_ids(client.bot_key)
     if not users:
         return await message.reply("No users found to broadcast.")
 
@@ -1559,6 +2398,7 @@ async def broadcast_cmd(client, message):
             admin_chat_id=message.chat.id,
             src_message_id=src_id,
             payload_text=payload_text,
+            bot_key=client.bot_key,
         )
         done += 1
         if outcome == "sent":
@@ -1585,7 +2425,7 @@ async def broadcast_cmd(client, message):
                     elapsed=elapsed,
                     cancelled=cancelled,
                 ),
-                reply_markup=cancel_markup if not cancelled and done < total else None,
+                markup=cancel_markup if not cancelled and done < total else None,
             )
 
     elapsed = time.monotonic() - started
@@ -1604,15 +2444,82 @@ async def broadcast_cmd(client, message):
             cancelled=cancelled,
             finished=True,
         ),
-        reply_markup=None,
+        markup=None,
     )
 
 
 # ===== MAIN HANDLER =====
-@app.on_message(filters.private & ~filters.command(["start", "premium", "myplan", "status", "broadcast"]))
+@app.on_message(filters.command("usage"))
+async def usage_cmd(client, message):
+    user_id = message.from_user.id
+    await _upsert_user_profile(message.from_user, client.bot_key)
+    if int(user_id) not in ADMIN_USER_IDS:
+        return await message.reply("❌ You are not allowed to use this command.")
+    if not TERABOX_API_KEY:
+        return await message.reply("XVERSE_API_KEY is not configured.")
+
+    status = await message.reply("Fetching usage info...")
+    try:
+        timeout = aiohttp.ClientTimeout(total=30)
+        headers = {"xAPIverse-Key": TERABOX_API_KEY}
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get("https://xapiverse.com/api/usage", headers=headers) as resp:
+                resp.raise_for_status()
+                data = await resp.json(content_type=None)
+    except Exception as e:
+        return await status.edit(f"Failed to fetch usage: {e}")
+
+    await status.edit(_format_api_usage(data))
+
+
+def _human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.2f}{unit}"
+        n /= 1024
+    return f"{n:.2f}TB"
+
+
+def _format_usage_value(key, value):
+    key_lower = key.lower()
+    if any(part in key_lower for part in ("key", "token", "secret", "password")):
+        return "***"
+    if isinstance(value, (int, float)) and any(
+        part in key_lower for part in ("size", "bytes", "bandwidth", "traffic", "storage")
+    ):
+        return _human_size(value)
+    return str(value)
+
+
+def _format_api_usage(data: dict) -> str:
+    if not data:
+        return "Usage info is empty."
+
+    lines = ["Usage:"]
+
+    def add_items(items, prefix=""):
+        for key, value in items.items():
+            label = f"{prefix}{str(key).replace('_', ' ').title()}"
+            if isinstance(value, dict):
+                lines.append(f"{label}:")
+                add_items(value, prefix="  ")
+            elif isinstance(value, list):
+                lines.append(f"{label}: {', '.join(map(str, value)) if value else 'None'}")
+            else:
+                lines.append(f"{label}: {_format_usage_value(str(key), value)}")
+
+    add_items(data)
+    return "\n".join(lines)
+
+
+@app.on_message(filters.private & ~filters.command([
+    "start", "premium", "myplan", "status", "usage", "broadcast",
+    "shortlink_on", "shortlink_off", "freemode_on", "freemode_off",
+    "sendfile_on", "sendfile_off",
+]))
 async def terabox(client, message):
     user_id = message.from_user.id
-    await _upsert_user_profile(message.from_user)
+    await _upsert_user_profile(message.from_user, client.bot_key)
 
     # Ignore queued old updates delivered after restart/deploy
     # to avoid mass "invalid link" replies to historical chats.
@@ -1648,7 +2555,11 @@ async def terabox(client, message):
             return
 
         for idx, url in enumerate(terabox_urls[:MAX_LINKS_PER_MESSAGE], start=1):
-            ok_credit, is_premium, daily_limit = await reserve_credit(user_id)
+            skip_quota = FREE_MODE_ENABLED
+            if skip_quota:
+                ok_credit, is_premium, daily_limit = True, True, 0
+            else:
+                ok_credit, is_premium, daily_limit = await reserve_credit(user_id)
             if not ok_credit:
                 if is_premium:
                     await message.reply(
@@ -1656,128 +2567,57 @@ async def terabox(client, message):
                     )
                     await send_quota_topup_menu(message, user_id, daily_limit=daily_limit)
                 else:
-                    await send_unlock_once(client, message, user_id)
+                    if QUOTA_ENABLED:
+                        await send_unlock_once(client, message, user_id)
+                    else:
+                        await send_premium_required_once(client, message, user_id)
                 return
 
             msg = await message.reply(f"Fetching ({idx}/{len(terabox_urls[:MAX_LINKS_PER_MESSAGE])})...")
-            data = await get_data(url)
+            result, err_msg = await fetch_terabox_link(url)
 
-            if not data or data.get("status") != "success":
-                api_msg = (data or {}).get("message") or "Failed to fetch data."
+            if not result:
                 await msg.edit(
-                    f"Failed ❌\n\n{api_msg}",
+                    f"Failed ❌\n\n{err_msg}",
                     reply_markup=_support_markup(),
                 )
                 # refund reserved credit because request didn't succeed
-                await refund_reserved_credit(user_id, daily_limit=daily_limit, n=1)
+                if not skip_quota:
+                    await refund_reserved_credit(user_id, daily_limit=daily_limit, n=1)
                 continue  # do NOT consume credits for invalid links
 
-            file = (data.get("list") or [{}])[0]
-            name = file.get("name", "file")
-            size = int(file.get("size", 0))
-            link = file.get("normal_dlink")
-            stream = (file.get("fast_stream_url") or {}).get("480p") or file.get("normal_dlink")
-
-            size_mb = round(size / 1024 / 1024, 2)
+            name = result["name"]
+            size_mb = result["size_mb"]
+            link = result["link"]
+            stream = result["stream"]
+            thumbnail = result["thumbnail"]
 
             # credit already reserved above (atomic)
+            ftoken = create_file_token(link, name, size_mb, stream, user_id)
+            caption = _file_options_caption(name, size_mb, has_stream=bool(stream))
+            markup = _build_file_options_markup(
+                ftoken,
+                stream=stream,
+                name=name,
+                size_mb=size_mb,
+                download_url=link,
+            )
 
-            # ===== SMALL FILE =====
-            if size <= MAX_SIZE and _is_valid_http_url(link):
-                os.makedirs("downloads", exist_ok=True)
-                path = f"downloads/{name}"
-
-                await msg.edit("Downloading...")
-                await download_file(link, path)
-
-                await msg.edit("Uploading...")
-
-                # For small files we still upload the full document, but we
-                # also attach streaming/watch buttons so users don't need
-                # to fully download to play.
-                buttons = []
-                if _is_valid_http_url(link):
-                    buttons.append([InlineKeyboardButton("⬇️ Download", url=link.strip())])
-                # if stream and _is_valid_http_url(stream):
-                #     buttons.append([InlineKeyboardButton("🎬 Stream Direct", url=stream.strip())])
-                if stream and PUBLIC_BASE_URL:
-                    stoken = create_stream_token(stream, name=name, size_mb=size_mb,
-                                                 download_url=link or "", quality="480p")
-                    web_app_url = f"{PUBLIC_BASE_URL}/player/{stoken}"
-                    if _is_valid_https_url(web_app_url):
-                        buttons.append([
-                             InlineKeyboardButton(
-                                "▶️ Watch Online",
-                                web_app=WebAppInfo(url=web_app_url),
-                            )
-                        ])
-                markup = InlineKeyboardMarkup(buttons) if buttons else None
-
-                sent = await client.send_document(
-                    message.chat.id,
-                    path,
-                    caption=_file_caption(name, size_mb),
-                    reply_markup=markup,
-                )
-
-                os.remove(path)
-                await msg.edit("✅ Sent. This file will be deleted in 45 minutes.")
-                _schedule_delete_message(client, sent.chat.id, sent.id)
-                _schedule_disable_and_mark_expired(client, msg.chat.id, msg.id, is_caption=False)
-                continue
-
-            # ===== LARGE FILE / BUTTONS =====
-            thumbnail = file.get("thumbnail")
-            buttons = []
-            if _is_valid_http_url(link):
-                buttons.append([InlineKeyboardButton("⬇️ Download", url=link.strip())])
-
-            # Always add direct stream URL if available
-            # if stream and _is_valid_http_url(stream):
-            #     buttons.append([InlineKeyboardButton("🎬 Stream Direct", url=stream.strip())])
-
-            # Add WebApp player link if configured
-            if stream and PUBLIC_BASE_URL:
-                stoken = create_stream_token(stream, name=name, size_mb=size_mb,
-                                             download_url=link or "", quality="480p")
-                web_app_url = f"{PUBLIC_BASE_URL}/player/{stoken}"
-                if _is_valid_https_url(web_app_url):
-                    buttons.append([
-                        InlineKeyboardButton(
-                            "▶️ Watch Online",
-                            web_app=WebAppInfo(url=web_app_url)
-                        )
-                    ])
-
-            if not buttons:
+            if not markup:
                 await msg.edit(
-                    f"📁 {name}\n📦 {size_mb} MB\n\n⚠️ No valid download/stream URLs returned.",
+                    f"📁 {name}\n📦 {size_mb} MB\n\n⚠️ No delivery options available.",
                     reply_markup=_support_markup(),
                 )
                 continue
 
-            caption = _file_caption(name, size_mb)
-            markup = InlineKeyboardMarkup(buttons)
-
-            # If thumbnail exists, show a photo card; otherwise, edit text as before.
-            if thumbnail and _is_valid_http_url(thumbnail):
-                info = await client.send_photo(
-                    message.chat.id,
-                    photo=thumbnail.strip(),
-                    caption=caption,
-                    reply_markup=markup,
-                )
-                try:
-                    await msg.delete()
-                except Exception:
-                    pass
-                _schedule_expire_media_message(client, info.chat.id, info.id)
-            else:
-                await msg.edit(
-                    caption,
-                    reply_markup=markup,
-                )
-                _schedule_disable_and_mark_expired(client, msg.chat.id, msg.id, is_caption=False)
+            await _send_file_options_message(
+                client,
+                message,
+                msg,
+                caption=caption,
+                markup=markup,
+                thumbnail=thumbnail,
+            )
 
     except Exception as e:
         await report_error(client, "terabox_handler", e, extra={"user_id": user_id})
@@ -1790,9 +2630,90 @@ async def terabox(client, message):
             pass
 
 
+@app.on_callback_query(filters.regex(r"^gfile:([a-zA-Z0-9]{16})$"))
+async def get_file_cb(client, callback_query):
+    user_id = callback_query.from_user.id
+    token = callback_query.data.split(":", 1)[1]
+    data = file_tokens.get(token)
+    if not data or data.get("expires_at", 0) <= _now_ts():
+        return await callback_query.answer("Session expired. Send the link again.", show_alert=True)
+    if int(data.get("user_id", 0)) != user_id:
+        return await callback_query.answer("Not your request.", show_alert=True)
+
+    if not await _has_premium_access(user_id):
+        return await callback_query.answer(
+            "Get File is a Premium feature. Use /premium to upgrade.",
+            show_alert=True,
+        )
+    if not SENDFILE_ENABLED:
+        return await callback_query.answer(
+            "Admin has temporarily closed Get File. Please try again later.",
+            show_alert=True,
+        )
+
+    link = (data.get("link") or "").strip()
+    name = data.get("name") or "file"
+    size_mb = float(data.get("size_mb") or 0)
+
+    if size_mb > TELEGRAM_MAX_UPLOAD_MB:
+        return await callback_query.answer(
+            f"File exceeds Telegram limit ({TELEGRAM_MAX_UPLOAD_MB:.0f} MB). Use Watch Online.",
+            show_alert=True,
+        )
+    if not _is_valid_http_url(link):
+        return await callback_query.answer("File URL unavailable.", show_alert=True)
+
+    await callback_query.answer("Starting premium file transfer…")
+
+    job_id = "".join(random.choices("0123456789abcdef", k=8))
+    _file_transfer_jobs[job_id] = {"cancel": asyncio.Event(), "user_id": user_id}
+    est_total = int(size_mb * 1024 * 1024) if size_mb > 0 else 0
+    est_eta_note = ""
+    if size_mb > 0:
+        est_eta_note = f"\nEstimated size: {size_mb} MB — speed and ETA update live below."
+
+    progress_msg = await callback_query.message.reply(
+        _transfer_progress_text(
+            name=name,
+            size_mb=size_mb,
+            phase="Preparing",
+            current=0,
+            total=est_total,
+            speed_bps=0,
+            elapsed=0,
+        ) + est_eta_note,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⏹ Cancel", callback_data=f"gfcancel:{job_id}")]
+        ]),
+    )
+
+    asyncio.create_task(_run_get_file_transfer(
+        client,
+        chat_id=progress_msg.chat.id,
+        progress_msg_id=progress_msg.id,
+        job_id=job_id,
+        link=link,
+        name=name,
+        size_mb=size_mb,
+    ))
+
+
+@app.on_callback_query(filters.regex(r"^gfcancel:([a-f0-9]{8})$"))
+async def get_file_cancel_cb(client, callback_query):
+    user_id = callback_query.from_user.id
+    job_id = callback_query.data.split(":", 1)[1]
+    job = _file_transfer_jobs.get(job_id)
+    if not job:
+        return await callback_query.answer("Nothing to cancel.", show_alert=False)
+    if int(job.get("user_id", 0)) != user_id:
+        return await callback_query.answer("Not allowed.", show_alert=True)
+    job["cancel"].set()
+    await callback_query.answer("Cancelling…", show_alert=False)
+
+
 @app.on_callback_query(filters.regex(r"^bcancel:([a-f0-9]{8})$"))
 async def broadcast_cancel_cb(client, callback_query):
-    if int(callback_query.from_user.id) != int(ADMIN_USER_ID):
+    if int(callback_query.from_user.id) not in ADMIN_USER_IDS:
         return await callback_query.answer("❌ Not allowed.", show_alert=True)
     job_id = callback_query.data.split(":", 1)[1]
     job = _broadcast_jobs.get(job_id)
@@ -1802,34 +2723,53 @@ async def broadcast_cancel_cb(client, callback_query):
     await callback_query.answer("Cancelling broadcast…", show_alert=False)
 
 
+@app.on_chat_join_request()
+async def force_sub_join_request(client, join_request):
+    """Record join requests so a pending user still passes the force-sub gate.
+
+    Bots cannot query pending requests, so this live update is the only chance
+    to learn about one. The request is left pending; nothing is approved here.
+    """
+    try:
+        user = getattr(join_request, "from_user", None)
+        chat = getattr(join_request, "chat", None)
+        if user is None or chat is None:
+            return
+        _record_join_request(user.id, chat.id)
+    except Exception as e:
+        await report_error(client, "force_sub_join_request", e)
+
+
 @app.on_callback_query(filters.regex(r"^check_join$"))
 async def check_join_cb(client, callback_query):
     user_id = callback_query.from_user.id
-    chat_ref = _force_sub_chat_ref()
-    if chat_ref is None:
-        await callback_query.answer("Join link is configured as invite; skipping verification.", show_alert=True)
+    if not _force_sub_targets():
+        await callback_query.answer("No channel is configured; skipping verification.", show_alert=True)
         return
-    try:
-        m = await client.get_chat_member(chat_ref, user_id)
-        is_joined = m.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
-    except ChatAdminRequired:
-        await callback_query.answer(
-            f"Bot is not admin in {FORCE_SUB_CHANNEL}. Ask admin to add bot as admin, then try again.",
-            show_alert=True,
-        )
-        return
-    except Exception:
-        is_joined = False
 
-    if is_joined:
+    missing = await _missing_force_sub(client, user_id)
+
+    if not missing:
         try:
             await callback_query.message.edit_text("✅ Verified! Now send your TeraBox link.")
         except ChatWriteForbidden:
             pass
+        except Exception:
+            pass
         await callback_query.answer("Verified ✅", show_alert=False)
         return
 
-    await callback_query.answer("Not joined yet. Please join the channel first.", show_alert=True)
+    # Still pending: keep only the channels they haven't joined yet.
+    names = ", ".join([await _force_sub_label(client, t) for t in missing])
+    try:
+        await callback_query.message.edit_reply_markup(await _join_markup(client, missing))
+    except Exception:
+        pass
+    if len(missing) == 1:
+        alert = f"Not joined yet. Please join {names} first."
+    else:
+        alert = f"Still {len(missing)} channels left to join: {names}"
+    await callback_query.answer(alert, show_alert=True)
 
 
 @app.on_callback_query(filters.regex(r"^buyplan:([a-zA-Z0-9_]+)$"))
@@ -2425,6 +3365,24 @@ async def razorpay_webhook():
     return {"ok": True}
 
 
+def _should_this_bot_notify(client: Client, bots_map: dict | None) -> bool:
+    """
+    All 3 bots are deployed separately but share one DB, so every instance's
+    reminder loop sees the same premium user doc. Only the bot the user most
+    recently used should actually send the DM, or all 3 would message them.
+    """
+    if not bots_map:
+        return True
+    best_key, best_ts = None, None
+    for k, v in bots_map.items():
+        ts = (v or {}).get("last_seen_at")
+        if isinstance(ts, datetime) and (best_ts is None or ts > best_ts):
+            best_key, best_ts = k, ts
+    if best_key is None:
+        return True
+    return best_key == getattr(client, "bot_key", None)
+
+
 async def _send_premium_expiry_reminders(client: Client) -> None:
     if users_col is None:
         return
@@ -2434,13 +3392,15 @@ async def _send_premium_expiry_reminders(client: Client) -> None:
             "premium_until": {"$type": "date"},
             "premium_tracking_enabled": True,
         },
-        {"user_id": 1, "premium_until": 1, "premium_reminders": 1}
+        {"user_id": 1, "premium_until": 1, "premium_reminders": 1, "bots": 1}
     )
     async for doc in cursor:
         user_id = int(doc.get("user_id") or 0)
         premium_until = doc.get("premium_until")
         reminders = doc.get("premium_reminders") or {}
         if not user_id or not isinstance(premium_until, datetime):
+            continue
+        if not _should_this_bot_notify(client, doc.get("bots")):
             continue
         if premium_until.tzinfo is None:
             premium_until = premium_until.replace(tzinfo=timezone.utc)
@@ -2494,13 +3454,16 @@ async def player(token: str):
     if not data or data.get("expires_at", 0) <= _now_ts():
         return Response("Stream link expired. Go back to the bot and generate again.", status=410)
 
-    # We route the playback through our proxy to avoid CORS issues in Telegram WebView.
+    # Try the upstream CDN directly first (0 Render bandwidth). Only fall back to
+    # our /hls proxy client-side if direct playback actually fails (e.g. no CORS
+    # headers from that source) — see fallback logic in the player script below.
+    direct_src = data['url']
     proxied_m3u8 = f"/hls?u={quote_plus(data['url'])}"
 
     file_name = html.escape(data.get("name") or "video.mp4")
     size_mb = data.get("size_mb") or 0
     quality = html.escape(data.get("quality") or "")
-    bot_username = html.escape(BOT_USERNAME or "TeraBot")
+    bot_username = html.escape(_current_bot_username() or "TeraBot")
     loot_deals_url = "https://t.me/+SVbNsGtmvfUzYzNl"
 
     page = f"""<!doctype html>
@@ -2523,6 +3486,17 @@ async def player(token: str):
       .header .titles .s {{ font-size: 12px; color: #8b93a7; margin-top: 2px; }}
       .player {{ position: relative; margin: 14px; border-radius: 14px; overflow: hidden; background: #000; }}
       video {{ width: 100%; display: block; aspect-ratio: 16/9; background: #000; }}
+      /* Telegram's WebView blocks requestFullscreen() on a container element,
+         so this CSS overlay is the fallback "fullscreen" for that case. */
+      .player.fake-fs {{ position: fixed; inset: 0; margin: 0; border-radius: 0; z-index: 9999;
+        display: flex; align-items: center; justify-content: center; }}
+      .player.fake-fs video {{ width: 100%; height: 100%; aspect-ratio: auto; object-fit: contain; }}
+      body.fs-lock {{ overflow: hidden; }}
+      /* Native fullscreen path: stretch the video to the whole screen too. */
+      .player:fullscreen {{ margin: 0; border-radius: 0; display: flex; align-items: center; justify-content: center; }}
+      .player:fullscreen video {{ width: 100%; height: 100%; aspect-ratio: auto; object-fit: contain; }}
+      .player:-webkit-full-screen {{ margin: 0; border-radius: 0; }}
+      .player:-webkit-full-screen video {{ width: 100%; height: 100%; aspect-ratio: auto; object-fit: contain; }}
       .badge {{ position: absolute; top: 10px; font-size: 11px; font-weight: 700; padding: 4px 8px;
         border-radius: 6px; background: rgba(0,0,0,0.55); backdrop-filter: blur(4px); }}
       .badge.quality {{ left: 10px; display: flex; align-items: center; gap: 5px; }}
@@ -2553,21 +3527,82 @@ async def player(token: str):
       .hint {{ display: flex; gap: 10px; margin: 0 14px 14px; padding: 12px; border-radius: 12px;
         background: #10162494; border: 1px solid #1c2333; font-size: 12px; line-height: 1.5; color: #b9c0d1; }}
       .hint svg {{ width: 16px; height: 16px; stroke: #8b93a7; fill: none; stroke-width: 2; flex-shrink: 0; margin-top: 1px; }}
-      .promo {{ margin: 0 14px 14px; padding: 16px; border-radius: 14px;
-        background: linear-gradient(135deg, #171233, #0f1a33); border: 1px solid #262a52; }}
-      .promo-head {{ display: flex; align-items: center; gap: 10px; }}
-      .promo-head .p-title {{ font-size: 15px; font-weight: 700; flex: 1; }}
-      .promo p {{ font-size: 12.5px; color: #b9c0d1; line-height: 1.5; margin: 8px 0 14px; }}
-      .promo-links a {{ display: flex; align-items: center; gap: 10px; padding: 12px; border-radius: 10px;
-        text-decoration: none; color: #fff; font-size: 13.5px; font-weight: 700; line-height: 1.3;
-        background: #1471ef; box-shadow: 0 4px 14px rgba(20,113,239,0.35); }}
-      .promo-links .ic {{ width: 34px; height: 34px; border-radius: 50%; background: rgba(255,255,255,0.18);
-        display: flex; align-items: center; justify-content: center; flex-shrink: 0; }}
-      .promo-links svg {{ width: 16px; height: 16px; fill: #fff; }}
-      .promo-links small {{ display: block; font-weight: 400; opacity: 0.85; font-size: 11.5px; margin-top: 1px; }}
+      .promo {{
+        margin: 0 14px 14px;
+        padding: 0;
+        border-radius: 16px;
+        overflow: hidden;
+        position: relative;
+        background: radial-gradient(120% 140% at 15% 0%, #3a1440 0%, #1a0f2e 35%, #0d1224 70%, #0b0f1e 100%);
+        border: 1px solid rgba(255, 183, 77, 0.35);
+        box-shadow: 0 8px 32px rgba(255, 90, 0, 0.18), inset 0 1px 0 rgba(255,255,255,0.06);
+      }}
+      .promo-top {{ padding: 16px 16px 12px; text-align: center; }}
+      .promo-flash {{
+        display: inline-flex; align-items: center; gap: 5px;
+        background: linear-gradient(135deg, #ff6d00, #ff2d55);
+        color: #fff; font-weight: 800; font-size: 10.5px; letter-spacing: 0.4px;
+        padding: 4px 10px; border-radius: 999px; margin-bottom: 10px;
+        box-shadow: 0 4px 14px rgba(255,45,85,0.35);
+      }}
+      .promo-title {{
+        font-size: 20px; font-weight: 900; line-height: 1.2; letter-spacing: -0.3px;
+        background: linear-gradient(135deg, #ffd580, #ff9900 55%, #ff5e3a);
+        -webkit-background-clip: text; background-clip: text; color: transparent;
+      }}
+      .promo-sub {{ font-size: 12.5px; color: #d6dae8; margin-top: 8px; line-height: 1.5; }}
+      .promo-sub b {{ color: #ffb74d; font-weight: 800; }}
+      .promo-body {{ padding: 4px 16px 16px; }}
+      .promo-pills {{
+        display: flex; gap: 8px; margin-bottom: 14px;
+      }}
+      .promo-pill {{
+        flex: 1; text-align: center; text-decoration: none;
+        font-size: 11px; font-weight: 800; padding: 9px 6px; border-radius: 999px;
+        color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }}
+      .promo-pill.loot {{ background: linear-gradient(135deg, #ff6d00, #ff9100); box-shadow: 0 4px 12px rgba(255,109,0,0.3); }}
+      .promo-pill.error {{ background: linear-gradient(135deg, #00c853, #00a844); box-shadow: 0 4px 12px rgba(0,200,83,0.3); }}
+      .promo-pill.hidden {{ background: linear-gradient(135deg, #7c4dff, #b388ff); box-shadow: 0 4px 12px rgba(124,77,255,0.3); }}
+      .promo-cta {{
+        display: flex; align-items: center; justify-content: space-between; gap: 10px;
+        padding: 14px 16px; border-radius: 14px; text-decoration: none; color: #fff;
+        background: linear-gradient(135deg, #0088cc 0%, #229ed9 100%);
+        box-shadow: 0 6px 20px rgba(0,136,204,0.4);
+        border: 1px solid rgba(255,255,255,0.15);
+        margin-bottom: 14px;
+      }}
+      .promo-cta:active {{ transform: scale(0.98); }}
+      .promo-cta .cta-left {{ display: flex; align-items: center; gap: 10px; min-width: 0; }}
+      .promo-cta .ic {{
+        width: 38px; height: 38px; border-radius: 50%;
+        background: rgba(255,255,255,0.2);
+        display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+      }}
+      .promo-cta svg {{ width: 18px; height: 18px; fill: #fff; }}
+      .promo-cta .cta-text {{ font-size: 14.5px; font-weight: 800; line-height: 1.3; }}
+      .promo-cta .cta-text small {{ display: block; font-weight: 500; opacity: 0.9; font-size: 11px; margin-top: 2px; }}
+      .promo-cta .arrow {{
+        width: 26px; height: 26px; border-radius: 50%; background: rgba(255,255,255,0.18);
+        display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+      }}
+      .promo-cta .arrow svg {{ width: 13px; height: 13px; stroke: #fff; fill: none; stroke-width: 2.5; }}
+      .promo-social {{ display: flex; align-items: center; justify-content: center; gap: 10px; }}
+      .promo-social .avatars {{ display: flex; }}
+      .promo-social .avatars span {{
+        width: 26px; height: 26px; border-radius: 50%; display: flex; align-items: center;
+        justify-content: center; font-size: 13px; border: 2px solid #1a0f2e; margin-left: -8px;
+      }}
+      .promo-social .avatars span:first-child {{ margin-left: 0; }}
+      .promo-social .avatars span:nth-child(1) {{ background: #ffb74d; }}
+      .promo-social .avatars span:nth-child(2) {{ background: #7c4dff; }}
+      .promo-social .avatars span:nth-child(3) {{ background: #ff5e7d; }}
+      .promo-social .avatars span:nth-child(4) {{ background: #00c853; font-size: 9px; font-weight: 800; color: #fff; }}
+      .promo-social .count {{ font-size: 11.5px; font-weight: 700; color: #ffb74d; }}
       .footer {{ text-align: center; padding: 16px; font-size: 12px; color: #6ea8ff; }}
     </style>
     <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
   </head>
   <body>
     <div class="card">
@@ -2611,19 +3646,32 @@ async def player(token: str):
 
       <div class="hint">
         <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
-        <div>If playback fails, the source may be temporarily unavailable.<br>Try again later or use the download option.</div>
+        <div>If playback fails, the source may be temporarily unavailable.<br>Try again later from the bot.</div>
       </div>
 
       <div class="promo">
-        <div class="promo-head">
-          <span>✨</span><span class="p-title">Stay Updated. Never Miss a Deal 🛍️!</span>
+        <div class="promo-top">
+          <div class="promo-flash">⚡ LIMITED TIME</div>
+          <div class="promo-title">🔥 BIG DEALS LIVE NOW!</div>
+          <div class="promo-sub">Up to <b>90% OFF</b> on Amazon, Flipkart, Myntra &amp; Ajio</div>
         </div>
-        <p>Up to 90% off Deals from Amazon Flipkart Ajio Myntra. Must Join</p>
-        <div class="promo-links">
-          <a href="{loot_deals_url}" target="_blank">
-            <span class="ic"><svg viewBox="0 0 24 24"><path d="M21 3L3 10.5l6.5 2.5L12 21l3-6 6-12z"/></svg></span>
-            <span>Join Loot Deals<small>Best Deals &amp; Offers</small></span>
+        <div class="promo-body">
+          <div class="promo-pills">
+            <a class="promo-pill loot" href="{loot_deals_url}" target="_blank">🔥 Loot Deals</a>
+            <a class="promo-pill error" href="{loot_deals_url}" target="_blank">$ Error Price</a>
+            <a class="promo-pill hidden" href="{loot_deals_url}" target="_blank">🎁 Hidden Coupons</a>
+          </div>
+          <a class="promo-cta" href="{loot_deals_url}" target="_blank">
+            <span class="cta-left">
+              <span class="ic"><svg viewBox="0 0 24 24"><path d="M21 3L3 10.5l6.5 2.5L12 21l3-6 6-12z"/></svg></span>
+              <span class="cta-text">Join Deal Channel<small>Best Deals &amp; Offers Daily</small></span>
+            </span>
+            <span class="arrow"><svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
           </a>
+          <div class="promo-social">
+            <div class="avatars"><span>🧑</span><span>👩</span><span>🧔</span><span>99+</span></div>
+            <div class="count">120K+ Smart Shoppers</div>
+          </div>
         </div>
       </div>
 
@@ -2631,16 +3679,61 @@ async def player(token: str):
     </div>
     <script>
       const video = document.getElementById('v');
-      const src = {proxied_m3u8!r};
-      if (video.canPlayType('application/vnd.apple.mpegurl')) {{
-        video.src = src;
-      }} else if (window.Hls && Hls.isSupported()) {{
-        const hls = new Hls({{ enableWorker: true, lowLatencyMode: true }});
-        hls.loadSource(src);
-        hls.attachMedia(video);
-      }} else {{
-        document.querySelector('.hint div').textContent = 'HLS not supported in this webview.';
+      const directSrc = {direct_src!r};
+      const proxiedSrc = {proxied_m3u8!r};
+      let usingProxy = false;
+      let currentHls = null;
+
+      // The stream may be an HLS manifest (fast_stream_url / play_url) or a
+      // progressive MP4 (normal_dlink fallback). Picking the loader by browser
+      // sniffing sent MP4s to hls.js on Chrome, which fetches by XHR and needs
+      // CORS the CDN may not send -- so playback failed and the file was then
+      // re-fetched through our own /hls proxy, costing us egress for nothing.
+      // Route by source type instead: <video src> needs no CORS and streams
+      // straight from the CDN; only real .m3u8 manifests go to hls.js.
+      function isHlsUrl(u) {{
+        try {{
+          return /\.m3u8$/i.test(decodeURIComponent(String(u).split('?')[0].split('#')[0]));
+        }} catch (e) {{
+          return /\.m3u8/i.test(String(u));
+        }}
       }}
+      const sourceIsHls = isHlsUrl(directSrc);
+
+      function loadSrc(url, isProxy) {{
+        usingProxy = isProxy;
+        if (currentHls) {{
+          currentHls.destroy();
+          currentHls = null;
+        }}
+        if (!sourceIsHls) {{
+          // Progressive file: let the browser stream it natively.
+          video.src = url;
+          return;
+        }}
+        if (video.canPlayType('application/vnd.apple.mpegurl')) {{
+          video.src = url;
+        }} else if (window.Hls && Hls.isSupported()) {{
+          const hls = new Hls({{ enableWorker: true, lowLatencyMode: true }});
+          currentHls = hls;
+          hls.loadSource(url);
+          hls.attachMedia(video);
+          hls.on(Hls.Events.ERROR, (_evt, data) => {{
+            if (data.fatal && !usingProxy) {{
+              loadSrc(proxiedSrc, true);
+            }}
+          }});
+        }} else {{
+          document.querySelector('.hint div').textContent = 'HLS not supported in this webview.';
+        }}
+      }}
+
+      // Direct-from-CDN first (saves bandwidth); silently fall back to the
+      // proxy on real playback failure (e.g. source has no CORS headers).
+      video.addEventListener('error', () => {{
+        if (!usingProxy) loadSrc(proxiedSrc, true);
+      }});
+      loadSrc(directSrc, false);
 
       function fmt(t) {{
         if (!isFinite(t) || t < 0) t = 0;
@@ -2681,10 +3774,72 @@ async def player(token: str):
       document.getElementById('back10').addEventListener('click', () => {{ video.currentTime = Math.max(0, video.currentTime - 10); }});
       document.getElementById('fwd10').addEventListener('click', () => {{ video.currentTime = Math.min(video.duration || 1e9, video.currentTime + 10); }});
       document.getElementById('muteBtn').addEventListener('click', () => {{ video.muted = !video.muted; }});
-      document.getElementById('fsBtn').addEventListener('click', () => {{
-        const el = document.querySelector('.player');
-        if (document.fullscreenElement) document.exitFullscreen();
-        else if (el.requestFullscreen) el.requestFullscreen();
+      // ===== Fullscreen =====
+      // Telegram's WebView blocks requestFullscreen() on a container element, and
+      // the Mini App itself runs in a partial-height sheet, so the plain
+      // el.requestFullscreen() call this replaced silently did nothing. Try each
+      // mechanism in turn and fall back to a CSS overlay.
+      const playerEl = document.querySelector('.player');
+      const fsBtn = document.getElementById('fsBtn');
+      const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+      let fakeFs = false;
+
+      try {{ if (tg) {{ tg.ready(); tg.expand(); }} }} catch (e) {{}}
+
+      function nativeFsEl() {{
+        return document.fullscreenElement || document.webkitFullscreenElement || null;
+      }}
+      function lockLandscape() {{
+        try {{
+          if (screen.orientation && screen.orientation.lock) {{
+            const p = screen.orientation.lock('landscape');
+            if (p && p.catch) p.catch(() => {{}});
+          }}
+        }} catch (e) {{}}
+      }}
+      function fakeFsOn() {{
+        fakeFs = true;
+        playerEl.classList.add('fake-fs');
+        document.body.classList.add('fs-lock');
+        // Bot API 8.0+: make the Mini App sheet itself cover the screen,
+        // otherwise the overlay only fills the half-height sheet.
+        try {{ if (tg && tg.requestFullscreen) tg.requestFullscreen(); }} catch (e) {{}}
+        lockLandscape();
+      }}
+      function fakeFsOff() {{
+        fakeFs = false;
+        playerEl.classList.remove('fake-fs');
+        document.body.classList.remove('fs-lock');
+        try {{ if (tg && tg.exitFullscreen) tg.exitFullscreen(); }} catch (e) {{}}
+        try {{ if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock(); }} catch (e) {{}}
+      }}
+      function enterFullscreen() {{
+        if (document.fullscreenEnabled && playerEl.requestFullscreen) {{
+          const p = playerEl.requestFullscreen();
+          if (p && p.catch) p.catch(fakeFsOn); // rejected (common in webviews)
+          lockLandscape();
+          return;
+        }}
+        if (playerEl.webkitRequestFullscreen) {{
+          playerEl.webkitRequestFullscreen();
+          lockLandscape();
+          return;
+        }}
+        // iOS WKWebView allows only the <video> element to enter fullscreen.
+        if (video.webkitEnterFullscreen) {{ video.webkitEnterFullscreen(); return; }}
+        fakeFsOn();
+      }}
+      function exitFullscreen() {{
+        if (fakeFs) {{ fakeFsOff(); return; }}
+        if (document.exitFullscreen) document.exitFullscreen();
+        else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+      }}
+      fsBtn.addEventListener('click', () => {{
+        if (fakeFs || nativeFsEl()) exitFullscreen();
+        else enterFullscreen();
+      }});
+      document.addEventListener('keydown', (e) => {{
+        if (e.key === 'Escape' && fakeFs) fakeFsOff();
       }});
     </script>
   </body>
@@ -2692,23 +3847,44 @@ async def player(token: str):
     return Response(page, mimetype="text/html")
 
 
+_HLS_FORWARD_RESPONSE_HEADERS = ("Content-Range", "Accept-Ranges")
+
+
 @bot.get("/hls")
 async def hls_proxy():
     """
     Proxy + rewrite m3u8/segments to same-origin URLs to avoid WebView CORS issues.
+
+    Manifests are small and get fully buffered (needed to rewrite segment URLs).
+    Everything else (.ts/.aac/.mp4 chunks) is streamed straight through without
+    buffering the whole body in memory, and incoming Range requests are forwarded
+    upstream so video seeking doesn't force a full-file re-download/re-serve.
     """
     u = request.args.get("u", "")
     if not u:
         return Response("Missing url", status=400)
 
     upstream = unquote_plus(u)
-    async with aiohttp.ClientSession() as session:
-        async with session.get(upstream) as resp:
-            content_type = resp.headers.get("content-type", "")
-            body = await resp.read()
+    range_header = request.headers.get("Range")
 
-    # If it's an m3u8, rewrite segment URLs to route back through this proxy.
-    if "application/vnd.apple.mpegurl" in content_type or upstream.endswith(".m3u8"):
+    session = aiohttp.ClientSession()
+    try:
+        resp_cm = session.get(upstream, headers={"Range": range_header} if range_header else None)
+        resp = await resp_cm.__aenter__()
+    except Exception:
+        await session.close()
+        return Response("Upstream fetch failed", status=502)
+
+    content_type = resp.headers.get("content-type", "")
+    is_manifest = "application/vnd.apple.mpegurl" in content_type or upstream.endswith(".m3u8")
+
+    if is_manifest:
+        try:
+            body = await resp.read()
+        finally:
+            await resp_cm.__aexit__(None, None, None)
+            await session.close()
+
         try:
             text = body.decode("utf-8", errors="ignore")
         except Exception:
@@ -2724,8 +3900,21 @@ async def hls_proxy():
 
         return Response("\n".join(out_lines) + "\n", content_type="application/vnd.apple.mpegurl")
 
-    # For .ts/.aac/.mp4 chunks etc, stream bytes as-is.
-    return Response(body, content_type=content_type or "application/octet-stream")
+    status = resp.status
+    out_headers = {
+        name: resp.headers[name] for name in _HLS_FORWARD_RESPONSE_HEADERS if name in resp.headers
+    }
+
+    async def body_stream():
+        try:
+            async for chunk in resp.content.iter_chunked(64 * 1024):
+                yield chunk
+        finally:
+            await resp_cm.__aexit__(None, None, None)
+            await session.close()
+
+    return Response(body_stream(), status=status, headers=out_headers,
+                     content_type=content_type or "application/octet-stream")
 
 
 @bot.get("/health")
@@ -2741,10 +3930,12 @@ async def before_serving():
         mongo_db = mongo_client[MONGO_DB_NAME]
         users_col = mongo_db["users"]
         payments_col = mongo_db["payments"]
+        await users_col.create_index("bot_keys")
     else:
         logger.warning("MongoDB not configured or motor missing; premium persistence disabled.")
     await app.start()
-    await _notify_admin(app, "✅ Bot started on Render/server.")
+    app.bot_key = _sanitize_bot_key(app.me.username, fallback_idx=1)
+    await _notify_admin(app, f"✅ Bot @{app.me.username} started on server.")
     if premium_reminder_task is None or premium_reminder_task.done():
         premium_reminder_task = asyncio.create_task(_premium_reminder_loop(app))
 
@@ -2768,6 +3959,8 @@ async def after_serving():
 
 # bot.run(port=8000)
 if __name__ == '__main__':
+    # Render (and most PaaS) inject the bind port via $PORT.
+    port = int(os.getenv("PORT", "8080"))
     loop = asyncio.get_event_loop()
-    loop.create_task(bot.run_task(host='0.0.0.0', port=8080))
+    loop.create_task(bot.run_task(host='0.0.0.0', port=port))
     loop.run_forever()
