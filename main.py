@@ -491,30 +491,20 @@ async def _referral_link(client, user_id: int) -> str:
 async def _apply_purchase(user_id: int, plan_key: str, payment_id: str = "") -> tuple[str, bool]:
     """Apply a paid purchase. Returns (user_message, was_new_purchase).
 
-    was_new_purchase is True only when a real premium/quota change was
-    written this call. False when the call was a duplicate (e.g. user
-    re-tapped "I have paid" with the same payment_id, or a second
-    premium payment arrived while one is still active).
+    Dedup of duplicate Razorpay payment_ids is the caller's
+    responsibility: callers must hold the per-user lock and must check
+    `payment_id` against the `payments` collection before calling.
+    This function only applies the plan.
 
-    Callers should send a Telegram admin notification only when
-    was_new_purchase is True, so repeated taps don't spam admin DMs.
+    was_new_purchase is always True for a real apply (premium reset
+    or quota top-up). Admin notifications should be gated on it so a
+    genuine webhook + manual-check race doesn't double-notify, but the
+    plan still gets applied exactly once.
     """
     plan = PREMIUM_PLANS[plan_key]
-    # Block repeat premium purchase while current plan is still active.
-    # Per-user lock so two concurrent paid callbacks can't both pass the
-    # active-premium check before either writes the new premium_until.
     if int(plan.get("days", 0)) > 0:
-        lock = _get_user_lock(user_id)
-        async with lock:
-            active = await _get_premium_until(user_id)
-            if active and active > _utc_now():
-                return (
-                    f"ℹ️ Premium already active till {active.strftime('%Y-%m-%d %H:%M UTC')}. "
-                    "Skipping duplicate purchase.",
-                    False,
-                )
-            until = await _apply_premium_plan(user_id, plan_key, payment_id=payment_id)
-            return f"✅ Premium activated till {until.strftime('%Y-%m-%d %H:%M UTC')}", True
+        until = await _apply_premium_plan(user_id, plan_key, payment_id=payment_id)
+        return f"✅ Premium activated till {until.strftime('%Y-%m-%d %H:%M UTC')}", True
     if int(plan.get("quota_add", 0)) > 0:
         added = await _apply_quota_addon(user_id, plan_key)
         return f"✅ Quota top-up successful. Added +{added} downloads for today.", True
