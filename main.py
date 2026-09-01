@@ -389,10 +389,11 @@ async def _get_quota_state(user_id: int, daily_limit: int) -> dict:
 
 async def _apply_premium_plan(user_id: int, plan_key: str, payment_id: str = "") -> datetime:
     plan = PREMIUM_PLANS[plan_key]
+    # Always anchor to now — never extend an existing premium by stacking
+    # new days on top. The "re-buy block while active" check lives in
+    # _apply_purchase; this is the single source of truth for expiry math.
     now = _utc_now()
-    current = await _get_premium_until(user_id)
-    base = current if current and current > now else now
-    new_until = base + timedelta(days=plan["days"])
+    new_until = now + timedelta(days=plan["days"])
     if users_col is not None:
         await users_col.update_one(
             {"user_id": int(user_id)},
@@ -489,9 +490,20 @@ async def _referral_link(client, user_id: int) -> str:
 
 async def _apply_purchase(user_id: int, plan_key: str, payment_id: str = "") -> str:
     plan = PREMIUM_PLANS[plan_key]
+    # Block repeat premium purchase while current plan is still active.
+    # Per-user lock so two concurrent paid callbacks can't both pass the
+    # active-premium check before either writes the new premium_until.
     if int(plan.get("days", 0)) > 0:
-        until = await _apply_premium_plan(user_id, plan_key, payment_id=payment_id)
-        return f"✅ Premium activated till {until.strftime('%Y-%m-%d %H:%M UTC')}"
+        lock = _get_user_lock(user_id)
+        async with lock:
+            active = await _get_premium_until(user_id)
+            if active and active > _utc_now():
+                return (
+                    f"ℹ️ Premium already active till {active.strftime('%Y-%m-%d %H:%M UTC')}. "
+                    "Skipping duplicate purchase."
+                )
+            until = await _apply_premium_plan(user_id, plan_key, payment_id=payment_id)
+            return f"✅ Premium activated till {until.strftime('%Y-%m-%d %H:%M UTC')}"
     if int(plan.get("quota_add", 0)) > 0:
         added = await _apply_quota_addon(user_id, plan_key)
         return f"✅ Quota top-up successful. Added +{added} downloads for today."
