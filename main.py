@@ -1254,7 +1254,7 @@ async def _missing_force_sub(client: Client, user_id: int) -> list[dict]:
         await _notify_admin(
             client,
             (
-                "âš ️ Force-sub check is skipped for these entries because they are "
+                "⚠️ Force-sub check is skipped for these entries because they are "
                 f"invite links: {names}\n\nSet a channel @username or numeric chat id "
                 "for membership verification."
             ),
@@ -1407,7 +1407,7 @@ def _file_caption(name: str, size_mb: float) -> str:
     return (
         f"📁 {name}\n"
         f"{size_line}\n\n"
-        f"âš ️ This file/message will be deleted automatically in 45 minutes (copyright)."
+        f"⚠️ This file/message will be deleted automatically in 45 minutes (copyright)."
     )
 
 
@@ -1425,13 +1425,8 @@ def _file_options_caption(
     ]
     if size_mb > TELEGRAM_MAX_UPLOAD_MB:
         lines.append(
-            f"\nâš ️ File exceeds Telegram upload limit ({TELEGRAM_MAX_UPLOAD_MB:.0f} MB). "
+            f"\n⚠️ File exceeds Telegram upload limit ({TELEGRAM_MAX_UPLOAD_MB:.0f} MB). "
             "Use Watch Online if Get File fails."
-        )
-    elif size_mb >= 100:
-        lines.append(
-            f"\nâš ️ Large file ({size_mb:.0f} MB). Get File streams from the source server "
-            "and may be slow; Watch Online is usually much faster."
         )
     return "\n".join(lines)
 
@@ -1454,7 +1449,7 @@ def _build_file_options_markup(
         web_app_url = f"{PUBLIC_BASE_URL}/player/{stoken}"
         if _is_valid_https_url(web_app_url):
             rows.append([InlineKeyboardButton(
-                "â–¶️ Watch Online",
+                "▶️ Watch Online",
                 web_app=WebAppInfo(url=web_app_url),
             )])
     # Download — shown to everyone. Free users tap → popup "Premium only";
@@ -2445,14 +2440,14 @@ async def send_quota_topup_menu(message, user_id: int, daily_limit: int):
     if not plan:
         return await message.reply("Top-up plan is unavailable right now.")
     text = (
-        f"âš ️ Daily limit reached ({daily_limit}/day).\n\n"
+        f"⚠️ Daily limit reached ({daily_limit}/day).\n\n"
         f"Need more today?\n"
         f"Buy {plan['label']} for ₹{plan['amount_inr']} / ⭐️{plan.get('stars', '-')}"
     )
     await message.reply(
         text,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("âž• Buy Quota Top-up", callback_data="buyplan:quota50")]
+            [InlineKeyboardButton("➕ Buy Quota Top-up", callback_data="buyplan:quota50")]
         ]),
     )
 
@@ -3010,7 +3005,7 @@ async def terabox(client, message):
 
             if not markup:
                 await msg.edit(
-                    f"📁 {name}\n📦 {size_mb} MB\n\nâš ️ No delivery options available.",
+                    f"📁 {name}\n📦 {size_mb} MB\n\n⚠️ No delivery options available.",
                     reply_markup=_support_markup(),
                 )
                 continue
@@ -3323,7 +3318,7 @@ async def pay_method_cb(client, callback_query):
                 caption=(
                     f"💳 Plan: {plan['label']} - ₹{plan['amount_inr']}\n\n"
                     f"Reference ID: {pay_ref}\n\n"
-                    "<b>âž¡️ Pay using UPI QR (Recommended)</b>\n\n"
+                    "<b>➡️ Pay using UPI QR (Recommended)</b>\n\n"
                     "<u>STEPS to Pay using QR</u>\n"
                     "1) Save above QR & Open any UPI app (GPay/PhonePe/Paytm/BHIM).\n"
                     "2) Upload and Scan this QR directly.\n"
@@ -3863,7 +3858,7 @@ async def _send_premium_expiry_reminders(client: Client) -> None:
                     if recently_expired:
                         await client.send_message(
                             user_id,
-                            "âš ️ Your premium plan has ended.\nUse /premium to renew and continue premium benefits."
+                            "⚠️ Your premium plan has ended.\nUse /premium to renew and continue premium benefits."
                         )
                     set_fields["premium_reminders.expired_sent"] = True
             elif delta <= timedelta(hours=3):
@@ -4099,7 +4094,7 @@ async def player(token: str):
 
       <div class="promo">
         <div class="promo-top">
-          <div class="promo-flash">âš¡ LIMITED TIME</div>
+          <div class="promo-flash">⚡ LIMITED TIME</div>
           <div class="promo-title">🔥 BIG DEALS LIVE NOW!</div>
           <div class="promo-sub">Up to <b>90% OFF</b> on Amazon, Flipkart, Myntra &amp; Ajio</div>
         </div>
@@ -4421,7 +4416,7 @@ async def before_serving():
 @bot.after_serving
 async def after_serving():
     global premium_reminder_task
-    await _notify_admin(app, "âš ️ Bot is stopping.")
+    await _notify_admin(app, "⚠️ Bot is stopping.")
     if premium_reminder_task and not premium_reminder_task.done():
         premium_reminder_task.cancel()
         try:
