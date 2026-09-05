@@ -204,6 +204,9 @@ premium_reminder_task = None
 _force_sub_warned = False
 # broadcast job_id -> {"cancel": asyncio.Event, "admin_id": int}
 _broadcast_jobs: dict[str, dict] = {}
+# admin_id -> message_id (the message they want to broadcast, attached via
+# /broadcast_attach when an inline reply wasn't preserved by the client)
+_broadcast_attach: dict[int, int] = {}
 # transfer job_id -> {"cancel": asyncio.Event, "user_id": int}
 _file_transfer_jobs: dict[str, dict] = {}
 # /gift flow: admin_id -> {"scope": "all"|"user", "target": int|None, "step": "days"|"confirm"|"resolved"}
@@ -3193,6 +3196,28 @@ async def sendfile_off_cmd(client, message):
     )
 
 
+@app.on_message(filters.command("broadcast_attach"))
+async def broadcast_attach_cmd(client, message):
+    """Admin-only. Reply to a message with this command to remember its id,
+    then send `/broadcast` (no reply) to use it as the broadcast source.
+    Useful when the client loses the inline reply_to_message on messages
+    that contain bot-managed inline keyboards.
+    """
+    user_id = int(message.from_user.id)
+    if user_id not in ADMIN_USER_IDS:
+        return await message.reply("❌ You are not allowed to use this command.")
+    src = message.reply_to_message
+    if not src:
+        return await message.reply(
+            "❌ Reply to a message first, then send `/broadcast_attach`."
+        )
+    _broadcast_attach[user_id] = int(src.id)
+    await message.reply(
+        f"📌 Attached message {src.id} for the next `/broadcast`.\n\n"
+        f"Send `/broadcast` (no reply needed) to broadcast this message."
+    )
+
+
 @app.on_message(filters.command("broadcast"))
 async def broadcast_cmd(client, message):
     user_id = message.from_user.id
@@ -3210,12 +3235,22 @@ async def broadcast_cmd(client, message):
         payload_text = command_text.split(" ", 1)[1].strip()
 
     src = message.reply_to_message
+    # If the inline reply was lost, fall back to a message_id the admin
+    # previously attached with /broadcast_attach.
+    if src is None:
+        attached_id = _broadcast_attach.pop(int(user_id), None)
+        if attached_id is not None:
+            try:
+                src = await client.get_messages(message.chat.id, attached_id)
+            except Exception:
+                src = None
     # Debug: log exactly what we received so silent failures are diagnosable.
     try:
         await _notify_admin(
             client,
             f"📣 broadcast received: payload_len={len(payload_text)} "
-            f"reply_to={'yes' if src else 'no'} "
+            f"reply_to={'yes' if message.reply_to_message else 'no'} "
+            f"resolved_src={'yes' if src else 'no'} "
             f"src_type={type(src).__name__ if src else 'None'} "
             f"src_id={src.id if src else None} "
             f"msg_id={message.id}",
@@ -3228,8 +3263,11 @@ async def broadcast_cmd(client, message):
             "Send one of:\n"
             "1) `/broadcast your text here` (broadcasts plain text)\n"
             "2) Long-press a message → Reply → type `/broadcast` "
-            "(copies that message, with optional new caption after the command)\n"
-            "3) Long-press a media message → Reply → `/broadcast new caption`"
+            "(copies that message)\n"
+            "3) Long-press a message → Reply → type `/broadcast new caption` "
+            "(replaces caption)\n"
+            "4) Reply to a message with `/broadcast_attach`, then send `/broadcast` "
+            "(use this if the reply was lost)"
         )
 
     # If the source message has inline buttons (e.g. our own /start keyboard),
@@ -3402,7 +3440,7 @@ def _format_api_usage(data: dict) -> str:
 
 
 @app.on_message(filters.private & ~filters.command([
-    "start", "premium", "myplan", "status", "usage", "broadcast",
+    "start", "premium", "myplan", "status", "usage", "broadcast", "broadcast_attach",
     "freemode_on", "freemode_off",
     "sendfile_on", "sendfile_off",
 ]))
