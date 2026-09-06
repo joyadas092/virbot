@@ -1854,36 +1854,29 @@ async def _broadcast_send_one(
     client: Client,
     *,
     target_id: int,
-    admin_chat_id: int,
-    src_message_id: int | None,
+    src_msg,          # The source Message object (already fetched by caller)
     payload_text: str,
     bot_key: str,
 ) -> str:
     """
     Returns: sent | blocked | removed | failed
+
+    src_msg: the Pyrogram Message to copy/forward. May be None when only
+             payload_text is given (plain-text broadcast).
     """
     try:
-        if src_message_id is not None:
-            # Always re-fetch and re-send by file_id. This works for media
-            # (photo/video/document/animation/audio/voice/sticker) AND text,
-            # bypasses inline-button restrictions, and avoids the
-            # BUTTON_URL_INVALID / CHAT_SEND_INLINE_FORBIDDEN errors that
-            # copyMessage triggers when forwarding bot-managed buttons.
-            src_msg = await client.get_messages(admin_chat_id, src_message_id)
-            # Pyrogram returns an empty Message object (not None) when not found.
-            if src_msg is None or not getattr(src_msg, "id", None):
-                return "failed"
-
-            # Build caption: admin override text takes priority.
-            # Use html-serialized text to preserve bold/italic/links/entities.
+        if src_msg is not None:
+            # Build caption: admin override text takes priority over original.
+            # Use caption_html / text.html to preserve bold/italic/links/entities.
             if payload_text:
                 caption = payload_text
                 parse_mode = ParseMode.MARKDOWN
             else:
-                caption = src_msg.caption_html or src_msg.caption or None
+                caption = getattr(src_msg, "caption_html", None) or getattr(src_msg, "caption", None) or None
                 parse_mode = ParseMode.HTML
 
-            text_html = src_msg.text.html if src_msg.text else None
+            raw_text = getattr(src_msg, "text", None)
+            text_html = (raw_text.html if hasattr(raw_text, "html") else str(raw_text)) if raw_text else None
 
             if src_msg.photo:
                 await client.send_photo(
@@ -1924,8 +1917,11 @@ async def _broadcast_send_one(
             if src_msg.sticker:
                 await client.send_sticker(target_id, src_msg.sticker.file_id)
                 return "sent"
+            if src_msg.video_note:
+                await client.send_video_note(target_id, src_msg.video_note.file_id)
+                return "sent"
             # Text-only message — preserve full HTML formatting
-            final_text = payload_text or text_html or src_msg.caption_html or src_msg.caption
+            final_text = payload_text or text_html or caption
             if final_text:
                 await client.send_message(
                     target_id, final_text,
@@ -1935,15 +1931,18 @@ async def _broadcast_send_one(
                 return "sent"
             return "failed"
         else:
-            await client.send_message(target_id, payload_text, disable_web_page_preview=True)
-        return "sent"
+            # Plain text broadcast
+            await client.send_message(
+                target_id, payload_text,
+                disable_web_page_preview=True,
+            )
+            return "sent"
     except FloodWait as e:
         await asyncio.sleep(float(e.value))
         return await _broadcast_send_one(
             client,
             target_id=target_id,
-            admin_chat_id=admin_chat_id,
-            src_message_id=src_message_id,
+            src_msg=src_msg,
             payload_text=payload_text,
             bot_key=bot_key,
         )
@@ -1964,7 +1963,7 @@ async def _broadcast_send_one(
                 e,
                 extra={
                     "target_id": int(target_id),
-                    "src_message_id": int(src_message_id) if src_message_id else None,
+                    "src_msg_id": getattr(src_msg, "id", None),
                     "has_payload": bool(payload_text),
                 },
             )
@@ -1978,6 +1977,7 @@ async def _broadcast_send_one(
             except Exception:
                 pass
         return "failed"
+
 
 
 async def _broadcast_edit_status(client: Client, chat_id: int, message_id: int, text: str, markup=None) -> None:
@@ -3331,11 +3331,10 @@ async def broadcast_cmd(client, message):
     done = 0
     started = time.monotonic()
     last_edit = 0.0
-    src_id = src.id if src is not None else None
 
-    cancel_markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏹ Cancel broadcast", callback_data=f"bcancel:{job_id}")]
-    ])
+    cancel_markup = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⏹ Cancel broadcast", callback_data=f"bcancel:{job_id}")]]
+    )
     status = await message.reply(
         _broadcast_progress_text(
             total=total,
@@ -3357,8 +3356,7 @@ async def broadcast_cmd(client, message):
         outcome = await _broadcast_send_one(
             client,
             target_id=int(target_id),
-            admin_chat_id=message.chat.id,
-            src_message_id=src_id,
+            src_msg=src,
             payload_text=payload_text,
             bot_key=client.bot_key,
         )
