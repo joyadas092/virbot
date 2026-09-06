@@ -1854,20 +1854,46 @@ async def _broadcast_send_one(
     client: Client,
     *,
     target_id: int,
-    src_msg,          # The source Message object (already fetched by caller)
+    src_msg,          # The source Message object (already fetched by caller). None = plain text only.
     payload_text: str,
     bot_key: str,
 ) -> str:
     """
     Returns: sent | blocked | removed | failed
 
-    src_msg: the Pyrogram Message to copy/forward. May be None when only
-             payload_text is given (plain-text broadcast).
+    Strategy:
+    1. If src_msg exists, try copy_message — this handles ALL media types (photo,
+       video, document, animation, audio, voice, sticker, video_note, text) in one
+       call, preserves formatting, strips inline buttons.
+    2. If copy_message fails (e.g. channel-restricted media), fall back to
+       per-type send_* using file_id.
+    3. If still nothing, fall back to sending payload_text as plain text.
     """
     try:
         if src_msg is not None:
-            # Build caption: admin override text takes priority over original.
-            # Use caption_html / text.html to preserve bold/italic/links/entities.
+            from_chat_id = src_msg.chat.id
+            msg_id = src_msg.id
+
+            # Caption override: admin can append/replace caption by typing after /broadcast
+            override_caption = payload_text or None
+            override_parse_mode = ParseMode.MARKDOWN if override_caption else None
+
+            # --- Primary: copy_message (works for ALL media types) ---
+            try:
+                await client.copy_message(
+                    chat_id=target_id,
+                    from_chat_id=from_chat_id,
+                    message_id=msg_id,
+                    caption=override_caption,        # None = keep original caption
+                    parse_mode=override_parse_mode,  # None = keep original parse_mode
+                    reply_markup=None,               # Strip inline buttons (can't forward them)
+                )
+                return "sent"
+            except Exception:
+                pass  # Fall through to per-type send below
+
+            # --- Fallback: per-type send using file_id ---
+            # (copy_message can fail for restricted/channel-linked media)
             if payload_text:
                 caption = payload_text
                 parse_mode = ParseMode.MARKDOWN
@@ -1878,49 +1904,49 @@ async def _broadcast_send_one(
             raw_text = getattr(src_msg, "text", None)
             text_html = (raw_text.html if hasattr(raw_text, "html") else str(raw_text)) if raw_text else None
 
-            if src_msg.photo:
+            if getattr(src_msg, "photo", None):
                 await client.send_photo(
                     target_id, src_msg.photo.file_id,
                     caption=caption, parse_mode=parse_mode,
                 )
                 return "sent"
-            if src_msg.video:
+            if getattr(src_msg, "video", None):
                 await client.send_video(
                     target_id, src_msg.video.file_id,
                     caption=caption, parse_mode=parse_mode,
                 )
                 return "sent"
-            if src_msg.document:
+            if getattr(src_msg, "document", None):
                 await client.send_document(
                     target_id, src_msg.document.file_id,
                     caption=caption, parse_mode=parse_mode,
                 )
                 return "sent"
-            if src_msg.animation:
+            if getattr(src_msg, "animation", None):
                 await client.send_animation(
                     target_id, src_msg.animation.file_id,
                     caption=caption, parse_mode=parse_mode,
                 )
                 return "sent"
-            if src_msg.audio:
+            if getattr(src_msg, "audio", None):
                 await client.send_audio(
                     target_id, src_msg.audio.file_id,
                     caption=caption, parse_mode=parse_mode,
                 )
                 return "sent"
-            if src_msg.voice:
+            if getattr(src_msg, "voice", None):
                 await client.send_voice(
                     target_id, src_msg.voice.file_id,
                     caption=caption, parse_mode=parse_mode,
                 )
                 return "sent"
-            if src_msg.sticker:
+            if getattr(src_msg, "sticker", None):
                 await client.send_sticker(target_id, src_msg.sticker.file_id)
                 return "sent"
-            if src_msg.video_note:
+            if getattr(src_msg, "video_note", None):
                 await client.send_video_note(target_id, src_msg.video_note.file_id)
                 return "sent"
-            # Text-only message — preserve full HTML formatting
+            # Text-only — preserve HTML formatting
             final_text = payload_text or text_html or caption
             if final_text:
                 await client.send_message(
@@ -1931,7 +1957,7 @@ async def _broadcast_send_one(
                 return "sent"
             return "failed"
         else:
-            # Plain text broadcast
+            # Plain text broadcast (no src message)
             await client.send_message(
                 target_id, payload_text,
                 disable_web_page_preview=True,
@@ -1969,7 +1995,6 @@ async def _broadcast_send_one(
             )
         except Exception:
             pass
-        # Last resort: text payload only.
         if payload_text:
             try:
                 await client.send_message(target_id, payload_text)
@@ -1977,7 +2002,6 @@ async def _broadcast_send_one(
             except Exception:
                 pass
         return "failed"
-
 
 
 async def _broadcast_edit_status(client: Client, chat_id: int, message_id: int, text: str, markup=None) -> None:
@@ -3136,20 +3160,37 @@ async def _resolve_gift_target(client: Client, replied) -> tuple[int | None, str
     return None, f"Could not resolve user '{text}'. Send a forwarded message, @username, or numeric user_id."
 
 
-@app.on_message(filters.private & filters.reply)
+async def _gift_reply_filter(_, __, message):
+    if not message.from_user or not message.reply_to_message:
+        return False
+    text = (message.text or message.caption or "").strip()
+    if text.startswith("/"):
+        return False
+    return int(message.from_user.id) in _gift_flow
+
+
+_gift_reply = filters.create(_gift_reply_filter)
+
+
+@app.on_message(filters.private & filters.reply & _gift_reply)
 async def gift_flow_handler(client, message):
     """Drives the /gift follow-up. Only fires for admins who are mid-flow and
     replied (via ForceReply) to one of our prompts."""
     user_id = int(message.from_user.id or 0)
     if user_id not in ADMIN_USER_IDS:
+        message.continue_propagation()
         return
     flow = _gift_flow.get(user_id)
     if not flow:
+        message.continue_propagation()
         return
     if not message.reply_to_message or not message.reply_to_message.from_user:
+        message.continue_propagation()
         return
-    if message.reply_to_message.from_user.id != (await client.get_me()).id:
+    bot_me = await client.get_me()
+    if message.reply_to_message.from_user.id != bot_me.id:
         # The reply was not to one of our ForceReply prompts.
+        message.continue_propagation()
         return
 
     if flow.get("scope") == "user" and flow.get("step") == "target":
