@@ -2359,30 +2359,48 @@ async def get_data(url):
                 raise RuntimeError(f"xverse bad JSON: {type(e).__name__}: {text[:200]}")
 
 
-def _normalize_xverse(data: dict | None) -> dict | None:
+def _normalize_xverse(data: dict | None) -> list[dict] | None:
+    """Return a list of normalized file dicts from the xverse API response."""
     if not data or data.get("status") != "success":
         return None
-    file = (data.get("list") or [{}])[0]
-    size = int(file.get("size", 0))
-    return {
-        "name": file.get("name", "file"),
-        "size_mb": round(size / 1024 / 1024, 2),
-        "link": file.get("normal_dlink") or "",
-        "stream": (file.get("fast_stream_url") or {}).get("480p") or file.get("normal_dlink") or "",
-        "thumbnail": file.get("thumbnail") or "",
-        "source": "xverse",
-    }
+    files = data.get("list") or []
+    if not files:
+        return None
+    results = []
+    for file in files:
+        if file.get("is_dir") == "1":
+            continue  # skip sub-folders
+        size = int(file.get("size", 0) or 0)
+        ftype = (file.get("type") or "").lower()
+        stream_urls = file.get("fast_stream_url") or {}
+        stream = (
+            stream_urls.get("480p")
+            or stream_urls.get("360p")
+            or (file.get("normal_dlink") if ftype == "video" else "")
+            or ""
+        )
+        results.append({
+            "name": file.get("name") or "file",
+            "size_mb": round(size / 1024 / 1024, 2),
+            "link": file.get("normal_dlink") or "",
+            "stream": stream,
+            "thumbnail": file.get("thumbnail") or "",
+            "source": "xverse",
+            "file_type": ftype,  # "video", "image", etc.
+        })
+    return results or None
 
 
-async def fetch_terabox_link(url: str) -> tuple[dict | None, str]:
+async def fetch_terabox_link(url: str) -> tuple[list[dict] | None, str]:
     """
     Tries free API #2, then falls back to the paid xverse API.
-    Returns (normalized_data, "") on success, or (None, error_message) on failure.
+    Returns (list_of_normalized_files, "") on success, or (None, error_message) on failure.
+    Multi-file links return multiple dicts; single-file links return a list with one dict.
     """
     try:
         r2 = await _call_api2(url)
         if r2:
-            return r2, ""
+            return [r2], ""  # api2 always returns single file — wrap in list
     except Exception:
         pass
 
@@ -3638,69 +3656,89 @@ async def terabox(client, message):
             return
 
         for idx, url in enumerate(terabox_urls[:MAX_LINKS_PER_MESSAGE], start=1):
-            if FREE_MODE_ENABLED:
-                # Free mode: still consume a credit slot so the user can't burn
-                # unlimited downloads, but treat them as premium (50/day cap)
-                # so they get the higher daily limit.
-                ok_credit, is_premium, daily_limit = await reserve_credit(user_id, force_premium=True)
-            else:
-                ok_credit, is_premium, daily_limit = await reserve_credit(user_id)
-            if not ok_credit:
-                if is_premium:
-                    await message.reply(
-                        f"💎 Premium daily limit reached ({daily_limit}/day). Please try again after UTC midnight."
-                    )
-                    await send_quota_topup_menu(message, user_id, daily_limit=daily_limit)
-                else:
-                    await send_premium_required_once(client, message, user_id)
-                return
-
+            # ── Step 1: fetch file list from API ────────────────────────────
             msg = await message.reply(f"Fetching ({idx}/{len(terabox_urls[:MAX_LINKS_PER_MESSAGE])})...")
-            result, err_msg = await fetch_terabox_link(url)
+            results_list, err_msg = await fetch_terabox_link(url)
 
-            if not result:
+            if not results_list:
                 await msg.edit(
                     f"Failed ❌\n\n{err_msg}",
                     reply_markup=_support_markup(),
                 )
-                # refund reserved credit because request didn't succeed
-                await refund_reserved_credit(user_id, daily_limit=daily_limit, n=1)
-                continue  # do NOT consume credits for invalid links
+                continue  # no credits consumed yet — skip
 
-            name = result["name"]
-            size_mb = result["size_mb"]
-            link = result["link"]
-            stream = result["stream"]
-            thumbnail = result["thumbnail"]
+            # ── Step 2: if multiple files, show a summary header ────────────
+            total_files = len(results_list)
+            if total_files > 1:
+                try:
+                    await msg.edit(f"📂 Found {total_files} files in this link. Preparing results...")
+                except Exception:
+                    pass
+            else:
+                # single file — delete the "Fetching..." message; result replaces it
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+                msg = None  # signal _send_file_options_message to send fresh
 
-            # credit already reserved above (atomic)
             is_premium = await _is_premium_user(user_id)
-            ftoken = create_file_token(link, name, size_mb, stream, user_id, source_url=url)
-            caption = _file_options_caption(name, size_mb, has_stream=bool(stream), is_premium=is_premium)
-            markup = _build_file_options_markup(
-                ftoken,
-                stream=stream,
-                name=name,
-                size_mb=size_mb,
-                download_url=link,
-                is_premium=is_premium,
-            )
 
-            if not markup:
-                await msg.edit(
-                    f"📁 {name}\n📦 {size_mb} MB\n\n⚠️ No delivery options available.",
-                    reply_markup=_support_markup(),
+            # ── Step 3: send one result card per file ────────────────────────
+            for file_idx, result in enumerate(results_list, start=1):
+                # Reserve one credit per file shown (not per URL)
+                if FREE_MODE_ENABLED:
+                    ok_credit, _, daily_limit = await reserve_credit(user_id, force_premium=True)
+                else:
+                    ok_credit, _, daily_limit = await reserve_credit(user_id)
+
+                if not ok_credit:
+                    if is_premium:
+                        await message.reply(
+                            f"💎 Premium daily limit reached ({daily_limit}/day). "
+                            f"Showed {file_idx - 1}/{total_files} files. Try again after UTC midnight."
+                        )
+                        await send_quota_topup_menu(message, user_id, daily_limit=daily_limit)
+                    else:
+                        await send_premium_required_once(client, message, user_id)
+                    break  # stop sending more files from this link
+
+                name = result["name"]
+                size_mb = result["size_mb"]
+                link = result["link"]
+                stream = result["stream"]
+                thumbnail = result["thumbnail"]
+
+                ftoken = create_file_token(link, name, size_mb, stream, user_id, source_url=url)
+                caption = _file_options_caption(name, size_mb, has_stream=bool(stream), is_premium=is_premium)
+                markup = _build_file_options_markup(
+                    ftoken,
+                    stream=stream,
+                    name=name,
+                    size_mb=size_mb,
+                    download_url=link,
+                    is_premium=is_premium,
                 )
-                continue
 
-            await _send_file_options_message(
-                client,
-                message,
-                msg,
-                caption=caption,
-                markup=markup,
-                thumbnail=thumbnail,
-            )
+                if not markup:
+                    await message.reply(
+                        f"📁 {name}\n📦 {size_mb} MB\n\n⚠️ No delivery options available.",
+                        reply_markup=_support_markup(),
+                    )
+                    continue
+
+                # For the first file of a single-file link, pass msg so it
+                # can be edited/reused. For subsequent files always send fresh.
+                use_msg = msg if (file_idx == 1 and total_files == 1) else None
+                await _send_file_options_message(
+                    client,
+                    message,
+                    use_msg,
+                    caption=caption,
+                    markup=markup,
+                    thumbnail=thumbnail,
+                )
+                msg = None  # only reuse for first file
 
     except Exception as e:
         await report_error(client, "terabox_handler", e, extra={"user_id": user_id})
