@@ -3656,7 +3656,23 @@ async def terabox(client, message):
             return
 
         for idx, url in enumerate(terabox_urls[:MAX_LINKS_PER_MESSAGE], start=1):
-            # ── Step 1: fetch file list from API ────────────────────────────
+            # ── Step 1: reserve 1 credit per URL (not per file) ─────────────
+            if FREE_MODE_ENABLED:
+                ok_credit, is_premium, daily_limit = await reserve_credit(user_id, force_premium=True)
+            else:
+                ok_credit, is_premium, daily_limit = await reserve_credit(user_id)
+
+            if not ok_credit:
+                if is_premium:
+                    await message.reply(
+                        f"💎 Premium daily limit reached ({daily_limit}/day). Please try again after UTC midnight."
+                    )
+                    await send_quota_topup_menu(message, user_id, daily_limit=daily_limit)
+                else:
+                    await send_premium_required_once(client, message, user_id)
+                return
+
+            # ── Step 2: fetch file list from API ────────────────────────────
             msg = await message.reply(f"Fetching ({idx}/{len(terabox_urls[:MAX_LINKS_PER_MESSAGE])})...")
             results_list, err_msg = await fetch_terabox_link(url)
 
@@ -3665,9 +3681,11 @@ async def terabox(client, message):
                     f"Failed ❌\n\n{err_msg}",
                     reply_markup=_support_markup(),
                 )
-                continue  # no credits consumed yet — skip
+                # refund reserved credit — fetch failed
+                await refund_reserved_credit(user_id, daily_limit=daily_limit, n=1)
+                continue
 
-            # ── Step 2: if multiple files, show a summary header ────────────
+            # ── Step 3: if multiple files, show a summary header ────────────
             total_files = len(results_list)
             if total_files > 1:
                 try:
@@ -3684,25 +3702,8 @@ async def terabox(client, message):
 
             is_premium = await _is_premium_user(user_id)
 
-            # ── Step 3: send one result card per file ────────────────────────
+            # ── Step 4: send one result card per file (all covered by 1 credit)
             for file_idx, result in enumerate(results_list, start=1):
-                # Reserve one credit per file shown (not per URL)
-                if FREE_MODE_ENABLED:
-                    ok_credit, _, daily_limit = await reserve_credit(user_id, force_premium=True)
-                else:
-                    ok_credit, _, daily_limit = await reserve_credit(user_id)
-
-                if not ok_credit:
-                    if is_premium:
-                        await message.reply(
-                            f"💎 Premium daily limit reached ({daily_limit}/day). "
-                            f"Showed {file_idx - 1}/{total_files} files. Try again after UTC midnight."
-                        )
-                        await send_quota_topup_menu(message, user_id, daily_limit=daily_limit)
-                    else:
-                        await send_premium_required_once(client, message, user_id)
-                    break  # stop sending more files from this link
-
                 name = result["name"]
                 size_mb = result["size_mb"]
                 link = result["link"]
