@@ -111,6 +111,7 @@ PREMIUM_END_REMINDER_WINDOW_HOURS = int(os.getenv("PREMIUM_END_REMINDER_WINDOW_H
 API_ID = int(os.getenv('API_ID'))
 API_HASH = os.getenv('API_HASH')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
+KINGX_API_KEY = (os.getenv('KINGX_API_KEY') or os.getenv('TERADL_API_KEY') or 'WqBPgmxioMHshN1CLYhbrjI7H3CrpFhSCdOjSz6EZyDP9V7E').strip()
 TERABOX_API_KEY = os.getenv('XVERSE_API_KEY')
 BOT_USERNAME = os.getenv('BOT_USERNAME')
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
@@ -725,8 +726,9 @@ def _format_ago(ts: float | None) -> str:
 
 def _api_status_text() -> str:
     labels = [
-        ("api2", "API2 (hostinger, free)"),
-        ("xverse", "API3 (xverse, paid fallback)"),
+        ("kingx", "API1 (kingx, primary)"),
+        ("xverse", "API2 (xverse, fallback)"),
+        ("api2", "API3 (hostinger, free)"),
     ]
     lines = ["🔌 API Health & Usage"]
     for key, label in labels:
@@ -2314,6 +2316,137 @@ async def _call_api2(url: str) -> dict | None:
     }
 
 
+def _normalize_kingx(data: dict | None) -> list[dict] | None:
+    """Return a list of normalized file dicts from the kingx API response."""
+    if not data:
+        return None
+    result = data.get("result") or {}
+    files = result.get("files") or []
+    if not files:
+        return None
+
+    results = []
+    for file in files:
+        if file.get("is_dir") in (1, "1", True):
+            continue  # skip sub-folders
+
+        name = file.get("server_filename") or file.get("name") or file.get("filename") or "file"
+
+        size_raw = file.get("size")
+        size_mb = 0.0
+        if size_raw is not None:
+            try:
+                size_mb = round(int(size_raw) / 1024 / 1024, 2)
+            except (ValueError, TypeError):
+                pass
+        if size_mb <= 0:
+            size_mb = _parse_size_string_to_mb(file.get("human_size") or "")
+
+        cat = file.get("category")
+        ext = os.path.splitext(name)[1].lower()
+        if cat == 1 or ext in (".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".ts", ".m4v"):
+            ftype = "video"
+        elif cat == 3 or ext in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
+            ftype = "image"
+        elif cat == 2 or ext in (".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg"):
+            ftype = "audio"
+        else:
+            ftype = (file.get("type") or "file").lower()
+
+        qualities = file.get("quality") or {}
+        stream = (
+            qualities.get("480")
+            or qualities.get("360")
+            or file.get("streaming_url")
+            or ""
+        )
+        if not stream and ftype == "video":
+            stream = file.get("dlink") or ""
+
+        # Upgrade http to https for teradl.kingx.dev to prevent Telegram WebApp mixed-content blocking
+        if stream.startswith("http://teradl.kingx.dev/"):
+            stream = "https://" + stream[len("http://"):]
+
+        dlink = (file.get("dlink") or "").strip()
+        thumb = file.get("thumb") or file.get("icon") or file.get("thumbnail") or ""
+
+        results.append({
+            "name": name,
+            "size_mb": size_mb,
+            "link": dlink,
+            "stream": stream,
+            "thumbnail": thumb,
+            "source": "kingx",
+            "file_type": ftype,
+        })
+
+    return results or None
+
+
+async def get_kingx_data(url: str) -> tuple[list[dict] | None, str]:
+    """Call kingx task API and poll until ready."""
+    if not KINGX_API_KEY:
+        return None, "KINGX_API_KEY is not configured"
+
+    task_url = (
+        f"https://teradl.kingx.dev/task?share_url={quote_plus(url)}"
+        f"&clearCache=1&key={quote_plus(KINGX_API_KEY)}"
+    )
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+    }
+
+    timeout = aiohttp.ClientTimeout(total=20)
+    ssl_ctx = _ssl_context_with_certifi()
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, connector=_threaded_connector()) as session:
+            async with session.get(task_url, headers=headers, ssl=ssl_ctx) as resp:
+                if resp.status not in (200, 202):
+                    body = await resp.text(errors="ignore")
+                    return None, f"Kingx task HTTP {resp.status}: {body[:200]}"
+                task_data = await resp.json(content_type=None)
+
+            task_id = (task_data or {}).get("task_id")
+            if not task_id:
+                return None, f"Kingx did not return task_id: {task_data}"
+
+            get_url = f"https://teradl.kingx.dev/gettask?id={quote_plus(str(task_id))}"
+
+            # Poll task until completion (max ~22s: 15 polls * 1.5s)
+            max_polls = 15
+            for _ in range(max_polls):
+                await asyncio.sleep(1.5)
+                try:
+                    async with session.get(get_url, headers=headers, ssl=ssl_ctx) as resp:
+                        if resp.status == 404:
+                            continue  # Task may not be registered yet
+                        if resp.status != 200:
+                            body = await resp.text(errors="ignore")
+                            logger.warning("Kingx gettask HTTP %s: %s", resp.status, body[:100])
+                            continue
+                        data = await resp.json(content_type=None)
+                except Exception as e:
+                    logger.warning("Kingx gettask poll error: %s", e)
+                    continue
+
+                state = str((data or {}).get("state") or (data or {}).get("status") or "").upper()
+                if state == "SUCCESS" or ("result" in (data or {}) and "files" in (data.get("result") or {})):
+                    norm = _normalize_kingx(data)
+                    if norm:
+                        return norm, ""
+                    return None, "Kingx returned no files"
+
+                if state == "FAILURE" or "error" in (data or {}):
+                    err = (data or {}).get("error") or "Task processing failed"
+                    return None, f"Kingx task error: {err}"
+
+            return None, "Kingx task timed out waiting for results"
+    except Exception as e:
+        return None, f"Kingx error: {type(e).__name__}: {e}"
+
+
 async def get_data(url):
     api_url = "https://xapiverse.com/api/terabox"
 
@@ -2393,10 +2526,26 @@ def _normalize_xverse(data: dict | None) -> list[dict] | None:
 
 async def fetch_terabox_link(url: str) -> tuple[list[dict] | None, str]:
     """
-    Tries free API #2, then falls back to the paid xverse API.
+    Tries primary API (kingx), then falls back to xverse (and free API2).
     Returns (list_of_normalized_files, "") on success, or (None, error_message) on failure.
     Multi-file links return multiple dicts; single-file links return a list with one dict.
     """
+    kingx_err = ""
+    # ── 1. Primary API: Kingx ──────────────────────────────────────────
+    if KINGX_API_KEY:
+        try:
+            kingx_files, kingx_err = await get_kingx_data(url)
+            if kingx_files:
+                _record_api_result("kingx", True)
+                return kingx_files, ""
+            _record_api_result("kingx", False, kingx_err or "No files")
+            logger.warning("Kingx primary API failed for %s: %s. Trying fallback...", url, kingx_err)
+        except Exception as e:
+            kingx_err = f"{type(e).__name__}: {e}"
+            _record_api_result("kingx", False, kingx_err)
+            logger.warning("Kingx exception for %s: %s. Trying fallback...", url, e)
+
+    # ── 2. Fallback API #1: Free API2 (hostinger, 1024terabox only) ────
     try:
         r2 = await _call_api2(url)
         if r2:
@@ -2404,11 +2553,15 @@ async def fetch_terabox_link(url: str) -> tuple[list[dict] | None, str]:
     except Exception:
         pass
 
+    # ── 3. Fallback API #2: xverse (paid) ──────────────────────────────
     try:
         xverse_data = await get_data(url)
     except Exception as e:
         _record_api_result("xverse", False, f"{type(e).__name__}: {e}")
-        return None, f"xverse error: {type(e).__name__}: {e}"
+        err_msg = f"xverse error: {type(e).__name__}: {e}"
+        if kingx_err:
+            err_msg = f"{err_msg} (Primary API: {kingx_err})"
+        return None, err_msg
 
     norm = _normalize_xverse(xverse_data)
     if norm:
@@ -2417,6 +2570,8 @@ async def fetch_terabox_link(url: str) -> tuple[list[dict] | None, str]:
 
     api_msg = (xverse_data or {}).get("message") or "Failed to fetch data."
     _record_api_result("xverse", False, api_msg)
+    if kingx_err:
+        api_msg = f"{api_msg} (Primary API: {kingx_err})"
     return None, api_msg
 
 
