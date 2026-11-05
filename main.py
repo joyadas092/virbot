@@ -442,6 +442,8 @@ async def _apply_gift_days(user_id: int, days: int) -> datetime | None:
             "premium_until": new_until,
             "updated_at": now,
             "last_plan": "gift",
+            "last_gift_at": now,
+            "last_gift_days": int(days),
             "premium_reminders": {},
             "premium_tracking_enabled": True,
         }},
@@ -727,8 +729,8 @@ def _format_ago(ts: float | None) -> str:
 def _api_status_text() -> str:
     labels = [
         ("kingx", "API1 (kingx, primary)"),
-        ("xverse", "API2 (xverse, fallback)"),
-        ("api2", "API3 (hostinger, free)"),
+        ("teraboxpro", "API2 (teraboxpro, secondary)"),
+        ("xverse", "API3 (xverse, fallback)"),
     ]
     lines = ["🔌 API Health & Usage"]
     for key, label in labels:
@@ -2266,56 +2268,6 @@ def _parse_size_string_to_mb(size_str: str) -> float:
     return round(val * mult, 2)
 
 
-def _extract_terabox_hash(url: str) -> str:
-    u = (url or "").strip()
-    m = re.search(r'/s/([A-Za-z0-9_-]+)', u)
-    if m:
-        return m.group(1)
-    qs = urlparse(u).query
-    m2 = re.search(r'surl=([A-Za-z0-9_-]+)', qs)
-    if m2:
-        h = m2.group(1)
-        return h if h.startswith("1") else f"1{h}"
-    return ""
-
-
-async def _call_api2(url: str) -> dict | None:
-    """Free API #2: hostingersite tera.php - only accepts 1024terabox.com links."""
-    # Only attempt when input is already a 1024terabox URL — rewriting from
-    # terabox/terashare/mirrobox/etc. to 1024terabox never resolves on the
-    # hostinger backend, so the call just wastes time and a free attempt.
-    if "1024terabox.com" not in url.lower():
-        return None
-    target_url = url
-
-    endpoint = f"https://gold-newt-367030.hostingersite.com/tera.php?url={quote_plus(target_url)}"
-    try:
-        timeout = aiohttp.ClientTimeout(total=20)
-        async with aiohttp.ClientSession(timeout=timeout, connector=_threaded_connector()) as session:
-            async with session.get(endpoint) as resp:
-                if resp.status != 200:
-                    _record_api_result("api2", False, f"HTTP {resp.status}")
-                    return None
-                data = await resp.json(content_type=None)
-    except Exception as e:
-        _record_api_result("api2", False, f"{type(e).__name__}: {e}")
-        return None
-
-    if not data or not data.get("success"):
-        _record_api_result("api2", False, (data or {}).get("message") or "success=false")
-        return None
-
-    _record_api_result("api2", True)
-    return {
-        "name": data.get("title") or "file",
-        "size_mb": 0.0,
-        "link": "",
-        "stream": data.get("play_url") or "",
-        "thumbnail": data.get("thumbnail") or "",
-        "source": "api2",
-    }
-
-
 def _normalize_kingx(data: dict | None) -> list[dict] | None:
     """Return a list of normalized file dicts from the kingx API response."""
     if not data:
@@ -2524,13 +2476,132 @@ def _normalize_xverse(data: dict | None) -> list[dict] | None:
     return results or None
 
 
+def _normalize_teraboxpro(data: dict | None) -> list[dict] | None:
+    """Return a list of normalized file dicts from the teraboxdownloader.pro API response."""
+    if not data or not isinstance(data, dict):
+        return None
+    if data.get("status") not in ("success", 200, True) and data.get("errno") not in (0, "0"):
+        return None
+
+    files = data.get("list")
+    if not isinstance(files, list) or not files:
+        return None
+
+    results = []
+    for file in files:
+        if not isinstance(file, dict):
+            continue
+        # Skip directories
+        if file.get("isdir") in (1, "1", True) or file.get("is_dir") in (1, "1", True):
+            continue
+
+        name = file.get("server_filename") or file.get("name") or file.get("filename") or "file"
+
+        # Calculate size in MB
+        size_raw = file.get("size")
+        size_mb = 0.0
+        if size_raw is not None:
+            try:
+                size_mb = round(int(size_raw) / 1024 / 1024, 2)
+            except (ValueError, TypeError):
+                pass
+        if size_mb <= 0:
+            size_mb = _parse_size_string_to_mb(file.get("formatted_size") or file.get("total_size") or "")
+
+        cat = file.get("category")
+        ext = os.path.splitext(name)[1].lower()
+        if cat == 1 or ext in (".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".ts", ".m4v"):
+            ftype = "video"
+        elif cat == 3 or ext in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
+            ftype = "image"
+        elif cat == 2 or ext in (".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg"):
+            ftype = "audio"
+        else:
+            ftype = (file.get("type") or "file").lower()
+
+        dlink = (
+            file.get("direct_link")
+            or file.get("download_link")
+            or file.get("fast_download_link")
+            or ""
+        ).strip()
+
+        stream = (
+            file.get("stream_url")
+            or file.get("direct_link")
+            or file.get("download_link")
+            or file.get("m3u8_url")
+            or ""
+        ).strip()
+        if not stream and ftype == "video":
+            stream = dlink
+
+        thumb = (
+            file.get("thumbnail")
+            or (file.get("thumbs") or {}).get("url3")
+            or (file.get("thumbs") or {}).get("url2")
+            or (file.get("thumbs") or {}).get("url1")
+            or (file.get("thumbs") or {}).get("icon")
+            or ""
+        ).strip()
+
+        results.append({
+            "name": name,
+            "size_mb": size_mb,
+            "link": dlink,
+            "stream": stream,
+            "thumbnail": thumb,
+            "source": "teraboxpro",
+            "file_type": ftype,
+        })
+
+    return results or None
+
+
+async def get_teraboxpro_data(url: str) -> tuple[list[dict] | None, str]:
+    """Call teraboxdownloader.pro public resolver API."""
+    api_url = f"https://www.teraboxdownloader.pro/api/fetch-video?url={quote_plus(url)}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://www.teraboxdownloader.pro/",
+        "Accept": "application/json, text/plain, */*",
+    }
+    timeout = aiohttp.ClientTimeout(total=25)
+    ssl_ctx = _ssl_context_with_certifi()
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, connector=_threaded_connector()) as session:
+            async with session.get(api_url, headers=headers, ssl=ssl_ctx) as resp:
+                if resp.status != 200:
+                    body = await resp.text(errors="ignore")
+                    return None, f"TeraboxPro HTTP {resp.status}: {body[:200]}"
+                data = await resp.json(content_type=None)
+
+            if not data or not isinstance(data, dict):
+                return None, "TeraboxPro returned invalid JSON"
+
+            if data.get("status") not in ("success", 200, True) and data.get("errno") not in (0, "0"):
+                err = data.get("message") or data.get("error") or f"errno {data.get('errno')}"
+                return None, f"TeraboxPro error: {err}"
+
+            norm = _normalize_teraboxpro(data)
+            if norm:
+                return norm, ""
+            return None, "TeraboxPro returned no valid files"
+    except Exception as e:
+        return None, f"TeraboxPro exception: {type(e).__name__}: {e}"
+
+
 async def fetch_terabox_link(url: str) -> tuple[list[dict] | None, str]:
     """
-    Tries primary API (kingx), then falls back to xverse (and free API2).
+    Tries primary API (kingx), then secondary API (teraboxpro),
+    and finally paid fallback (xverse).
     Returns (list_of_normalized_files, "") on success, or (None, error_message) on failure.
     Multi-file links return multiple dicts; single-file links return a list with one dict.
     """
     kingx_err = ""
+    tbpro_err = ""
+
     # ── 1. Primary API: Kingx ──────────────────────────────────────────
     if KINGX_API_KEY:
         try:
@@ -2539,28 +2610,34 @@ async def fetch_terabox_link(url: str) -> tuple[list[dict] | None, str]:
                 _record_api_result("kingx", True)
                 return kingx_files, ""
             _record_api_result("kingx", False, kingx_err or "No files")
-            logger.warning("Kingx primary API failed for %s: %s. Trying fallback...", url, kingx_err)
+            logger.warning("Kingx primary API failed for %s: %s. Trying secondary API...", url, kingx_err)
         except Exception as e:
             kingx_err = f"{type(e).__name__}: {e}"
             _record_api_result("kingx", False, kingx_err)
-            logger.warning("Kingx exception for %s: %s. Trying fallback...", url, e)
+            logger.warning("Kingx exception for %s: %s. Trying secondary API...", url, e)
 
-    # ── 2. Fallback API #1: Free API2 (hostinger, 1024terabox only) ────
+    # ── 2. Secondary API: TeraboxPro (free public resolver) ─────────────
     try:
-        r2 = await _call_api2(url)
-        if r2:
-            return [r2], ""  # api2 always returns single file — wrap in list
-    except Exception:
-        pass
+        tbpro_files, tbpro_err = await get_teraboxpro_data(url)
+        if tbpro_files:
+            _record_api_result("teraboxpro", True)
+            return tbpro_files, ""
+        _record_api_result("teraboxpro", False, tbpro_err or "No files")
+        logger.warning("TeraboxPro secondary API failed for %s: %s. Trying fallback...", url, tbpro_err)
+    except Exception as e:
+        tbpro_err = f"{type(e).__name__}: {e}"
+        _record_api_result("teraboxpro", False, tbpro_err)
+        logger.warning("TeraboxPro exception for %s: %s. Trying fallback...", url, e)
 
-    # ── 3. Fallback API #2: xverse (paid) ──────────────────────────────
+    # ── 3. Fallback API: xverse (paid) ─────────────────────────────────
     try:
         xverse_data = await get_data(url)
     except Exception as e:
         _record_api_result("xverse", False, f"{type(e).__name__}: {e}")
         err_msg = f"xverse error: {type(e).__name__}: {e}"
-        if kingx_err:
-            err_msg = f"{err_msg} (Primary API: {kingx_err})"
+        err_details = [e for e in [kingx_err and f"Primary: {kingx_err}", tbpro_err and f"Secondary: {tbpro_err}"] if e]
+        if err_details:
+            err_msg = f"{err_msg} ({'; '.join(err_details)})"
         return None, err_msg
 
     norm = _normalize_xverse(xverse_data)
@@ -2570,8 +2647,9 @@ async def fetch_terabox_link(url: str) -> tuple[list[dict] | None, str]:
 
     api_msg = (xverse_data or {}).get("message") or "Failed to fetch data."
     _record_api_result("xverse", False, api_msg)
-    if kingx_err:
-        api_msg = f"{api_msg} (Primary API: {kingx_err})"
+    err_details = [e for e in [kingx_err and f"Primary: {kingx_err}", tbpro_err and f"Secondary: {tbpro_err}"] if e]
+    if err_details:
+        api_msg = f"{api_msg} ({'; '.join(err_details)})"
     return None, api_msg
 
 
@@ -3164,13 +3242,14 @@ async def gift_cmd(client, message):
     if user_id not in ADMIN_USER_IDS:
         return await message.reply("❌ You are not allowed to use this command.")
     _gift_flow.pop(user_id, None)
+    bot_label = f"@{client.me.username}" if client.me and getattr(client.me, "username", None) else (getattr(client, "bot_key", "") or "This Bot")
     await message.reply(
-        "🎁 <b>Gift premium</b>\n\n"
-        "Who do you want to grant premium to?",
+        f"🎁 <b>Gift premium ({bot_label})</b>\n\n"
+        f"Who do you want to grant premium to on <b>{bot_label}</b>?",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("💎 All current premium", callback_data="gift:premium")],
-            [InlineKeyboardButton("🌐 All users", callback_data="gift:all")],
+            [InlineKeyboardButton(f"💎 Current Premium ({bot_label})", callback_data="gift:premium")],
+            [InlineKeyboardButton(f"🤖 All Users ({bot_label})", callback_data="gift:all")],
             [InlineKeyboardButton("👤 Specific user", callback_data="gift:user")],
             [InlineKeyboardButton("❌ Cancel", callback_data="gift:cancel")],
         ]),
@@ -3192,11 +3271,14 @@ async def gift_cb(client, callback_query):
             pass
         return await callback_query.answer()
 
+    bot_key = getattr(client, "bot_key", None) or _sanitize_bot_key(client.me.username if client.me else "")
+    bot_label = f"@{client.me.username}" if client.me and getattr(client.me, "username", None) else (bot_key or "this bot")
+
     if action == "premium":
         _gift_flow[user_id] = {"scope": "premium", "step": "days"}
         try:
             await callback_query.message.edit(
-                "💎 Extending premium for <b>all currently active premium users</b>.\n\n"
+                f"💎 Extending premium for active premium users of <b>{bot_label}</b>.\n\n"
                 "How many days do you want to add? (use a negative number to subtract)\n"
                 "Reply to this message with the number.",
                 parse_mode=ParseMode.HTML,
@@ -3214,7 +3296,7 @@ async def gift_cb(client, callback_query):
         _gift_flow[user_id] = {"scope": "all", "step": "days"}
         try:
             await callback_query.message.edit(
-                "🌐 Extending premium for <b>all users</b>.\n\n"
+                f"🤖 Extending premium for all users of <b>{bot_label}</b>.\n\n"
                 "How many days do you want to add? (use a negative number to subtract)\n"
                 "Reply to this message with the number.",
                 parse_mode=ParseMode.HTML,
@@ -3259,12 +3341,13 @@ async def gift_cb(client, callback_query):
         if flow["scope"] == "all":
             if users_col is None:
                 return await callback_query.answer("DB not configured.", show_alert=True)
-            # Extend everyone who already has a profile (premium or not);
-            # if no premium_until set, treat as starting from now.
             now = _utc_now()
-            cursor = users_col.find({}, {"user_id": 1, "premium_until": 1})
+            # Only extend users that belong to THIS bot
+            query = {"bot_keys": bot_key} if bot_key else {}
+            cursor = users_col.find(query, {"user_id": 1, "premium_until": 1, "last_gift_at": 1})
             updated = 0
             skipped = 0
+            already_gifted = 0
             async for doc in cursor:
                 uid = doc.get("user_id")
                 if not isinstance(uid, int):
@@ -3274,6 +3357,16 @@ async def gift_cb(client, callback_query):
                 if cur is None and not await _user_has_profile(uid):
                     skipped += 1
                     continue
+
+                # Deduplication: If adding days and user was already gifted within the last 12 hours (e.g. by another bot sharing the DB), skip to prevent multi-bot multiplication
+                last_gift = doc.get("last_gift_at")
+                if days > 0 and isinstance(last_gift, datetime):
+                    if last_gift.tzinfo is None:
+                        last_gift = last_gift.replace(tzinfo=timezone.utc)
+                    if (now - last_gift) < timedelta(hours=12):
+                        already_gifted += 1
+                        continue
+
                 new_until = await _apply_gift_days(uid, days)
                 updated += 1
                 if days > 0 and new_until:
@@ -3290,12 +3383,15 @@ async def gift_cb(client, callback_query):
             _gift_flow.pop(user_id, None)
             await _notify_admin(
                 client,
-                f"🎁 /gift (all): {days:+d} days applied to {updated} users ({skipped} skipped).",
+                f"🎁 /gift (all - {bot_label}): {days:+d} days applied to {updated} users "
+                f"({already_gifted} already gifted recently, {skipped} skipped).",
             )
             try:
                 await callback_query.message.edit(
-                    f"✅ Done. Applied {days:+d} days to {updated} users.\n"
-                    f"({skipped} users had no profile yet and were skipped.)"
+                    f"✅ Done on {bot_label}!\n\n"
+                    f"• Applied {days:+d} days to: <b>{updated}</b> users\n"
+                    f"• Already gifted recently (skipped): <b>{already_gifted}</b>\n"
+                    f"• Skipped (no profile): <b>{skipped}</b>"
                 )
             except Exception:
                 pass
@@ -3305,16 +3401,30 @@ async def gift_cb(client, callback_query):
             if users_col is None:
                 return await callback_query.answer("DB not configured.", show_alert=True)
             now = _utc_now()
-            # Only users whose premium_until is in the future.
+            # Only users of THIS bot whose premium_until is in the future.
+            query = {"premium_until": {"$gt": now}}
+            if bot_key:
+                query["bot_keys"] = bot_key
             cursor = users_col.find(
-                {"premium_until": {"$gt": now}},
-                {"user_id": 1, "premium_until": 1},
+                query,
+                {"user_id": 1, "premium_until": 1, "last_gift_at": 1},
             )
             updated = 0
+            already_gifted = 0
             async for doc in cursor:
                 uid = doc.get("user_id")
                 if not isinstance(uid, int):
                     continue
+
+                # Deduplication: If adding days and user was already gifted within 12 hours, skip
+                last_gift = doc.get("last_gift_at")
+                if days > 0 and isinstance(last_gift, datetime):
+                    if last_gift.tzinfo is None:
+                        last_gift = last_gift.replace(tzinfo=timezone.utc)
+                    if (now - last_gift) < timedelta(hours=12):
+                        already_gifted += 1
+                        continue
+
                 new_until = await _apply_gift_days(uid, days)
                 updated += 1
                 if days > 0 and new_until:
@@ -3331,11 +3441,14 @@ async def gift_cb(client, callback_query):
             _gift_flow.pop(user_id, None)
             await _notify_admin(
                 client,
-                f"🎁 /gift (premium): {days:+d} days applied to {updated} active premium users.",
+                f"🎁 /gift (premium - {bot_label}): {days:+d} days applied to {updated} active premium users "
+                f"({already_gifted} already gifted recently).",
             )
             try:
                 await callback_query.message.edit(
-                    f"✅ Done. Applied {days:+d} days to {updated} currently active premium users."
+                    f"✅ Done on {bot_label}!\n\n"
+                    f"• Applied {days:+d} days to: <b>{updated}</b> active premium users\n"
+                    f"• Already gifted recently (skipped): <b>{already_gifted}</b>"
                 )
             except Exception:
                 pass
@@ -3468,18 +3581,20 @@ async def gift_flow_handler(client, message):
             return await message.reply("❌ Days cannot be zero.")
         flow["days"] = days
         flow["step"] = "confirm"
+        bot_label = f"@{client.me.username}" if client.me and getattr(client.me, "username", None) else "this bot"
         if flow["scope"] == "all":
             body = (
-                f"🌐 Confirm: extend premium by <b>{days:+d} days</b> for <b>all users</b>?\n\n"
-                f"This affects every user with a profile. Run again to undo by entering "
-                f"<code>{-days}</code> days."
+                f"🌐 Confirm: extend premium by <b>{days:+d} days</b> for all users of <b>{bot_label}</b>?\n\n"
+                f"Only users who interacted with {bot_label} will be affected. "
+                f"Users who already received a gift today will be skipped automatically to prevent duplicate stacking. "
+                f"Run again to undo by entering <code>{-days}</code> days."
             )
         elif flow["scope"] == "premium":
             body = (
                 f"💎 Confirm: extend premium by <b>{days:+d} days</b> for "
-                f"<b>all currently active premium users</b>?\n\n"
-                f"Users with no active premium are skipped. Run again to undo by entering "
-                f"<code>{-days}</code> days."
+                f"active premium users of <b>{bot_label}</b>?\n\n"
+                f"Only active premium users of {bot_label} will be affected. "
+                f"Run again to undo by entering <code>{-days}</code> days."
             )
         else:
             body = (
